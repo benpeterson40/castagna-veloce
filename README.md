@@ -82,8 +82,12 @@ landed.
 
 ### Multiple cards
 
-- **PCIe all-reduce for tensor parallelism:** kernel peer writes for decode-sized tensors and
-  copy-engine DMA for prefill-sized ones (DMA: +2% prefill).
+- **Tensor-parallel pairs:** with 4 or more cards, tensor parallelism runs inside pairs of
+  cards and the layers are pipelined across the pairs
+  ([how it works](#tensor-parallel-pairs)).
+- **PCIe all-reduce for both layouts:** pairs write straight into the peer card's memory;
+  groups of four use kernel peer writes for decode-sized tensors and copy-engine DMA for
+  prefill-sized ones (DMA: +2% prefill).
 - **Persistent hyper-connection and MoE kernels** with each pair's all-reduce fused in, for
   the Qwen3.8 Flash-Next decode profile.
 - **Split output head** for DeepSeek V4, with a mirrored copy for the DSpark drafter: plain
@@ -109,6 +113,54 @@ landed.
 - **F32-accumulating vision encoders** for GLM-5.3, Qwen3.8 and DeepSeek V4.1: 0.13–1.7% off a
   full-precision reference, against 4.7–23% before. This costs some encode time, not speed
   elsewhere.
+
+## Tensor-parallel pairs
+
+With 4 or more cards, Castagna Veloce runs tensor parallelism in **pairs** by default. Each
+pair splits every matrix of its layers across its two cards, the layers are divided between
+the pairs, and the pairs run as a pipeline. Upstream llama.cpp's `-sm tensor` always puts all
+cards into one group.
+
+```mermaid
+flowchart LR
+  subgraph P1["Pair 1: first half of the layers"]
+    G0["GPU 0"] <-->|all-reduce| G1["GPU 1"]
+  end
+  subgraph P2["Pair 2: second half of the layers"]
+    G2["GPU 2"] <-->|all-reduce| G3["GPU 3"]
+  end
+  P1 -->|activations| P2
+```
+
+Why pairs suit the MI50:
+
+- **Point-to-point exchanges.** These cards have no fast links between them, so every
+  tensor-parallel all-reduce crosses PCIe. Inside a pair, each card exchanges with one peer
+  only. A group of four needs an all-to-all exchange in which every card sends to three others
+  over shared PCIe lanes.
+- **Direct writes into the peer's memory.** The MI50 exposes all of its VRAM over PCIe (a
+  32 GB BAR). Each card pushes its partial result into an inbox on the other card and raises a
+  flag there, then waits on its own local memory. That is one PCIe crossing per value instead
+  of a round trip through host memory. Cards without peer access fall back to staging through
+  host memory automatically.
+- **The pairs overlap.** Reductions are queued deep on the GPUs, so the host can submit a whole
+  step ahead and both pairs work at the same time instead of taking turns.
+- **Fused into the layer.** In Qwen3.8 Flash-Next's decode profile, each pair's all-reduce runs
+  inside persistent kernels that also do the model's hyper-connection and MoE steps. Both cards
+  add the partial results in the same order, so their copies stay bit-identical.
+
+Choosing the layout:
+
+| `LLAMA_TP_GROUP` | Layout |
+| --- | --- |
+| unset (4 or more cards) | pairs: 2 + 2 on 4 cards, 2 + 2 + 2 + 2 on 8 |
+| `4` | groups of four: one group on 4 cards, two on 8 |
+| `0` | one group over all cards, as in upstream llama.cpp |
+
+`LLAMA_TP_LAYER_SPLIT=a,b,...` sets the share of layers each group gets; by default it follows
+each group's free memory. The model guides set the layout per model: Qwen3.8 Flash-Next decodes
+as two pairs, while DeepSeek V4, GLM-5.3 and DeepSeek V4.1 run as groups of four
+(`LLAMA_TP_GROUP=4`).
 
 ## Philosophy
 
@@ -205,6 +257,9 @@ has the download and serve commands for that model.
 - **Cards:** tested on MI50 32 GB (VBIOS 113-D1631700-111). The MI60 is the same `gfx906`
   chip and should work, but it is untested. The 16 GB MI50 needs more cards for the same
   models.
+- **Peer access:** the fastest pair all-reduce writes directly into the other card's VRAM,
+  which needs the full 32 GB BAR. Our cards have it; on cards without peer access the engine
+  stages the exchange through host memory instead.
 - **PCIe slots matter for prefill.** The tensor-parallel all-reduce moves several MB per
   layer during prefill. On our board only 3 of 8 slots are x16; a 2-card model on two x16
   cards prefills about 4% faster than on an x16 + x8 pair. Decode is barely affected.
