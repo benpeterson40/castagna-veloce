@@ -511,11 +511,14 @@ llama_context::llama_context(
                 }
                 return false;
             };
-            // also a DeepSeek V4 target whose vocabulary head is split over its devices (LLAMA_DSV4_OUTPUT_SPLIT=1): the
-            // DSpark Markov head adds a whole-vocabulary bias to the draft's logits and takes their argmax, so the draft
-            // reads a private, mirrored copy of the head (+563 MB per GPU; the target's verify keeps the split head)
-            static const bool dsv4_output_split = [] { const char * e = getenv("LLAMA_DSV4_OUTPUT_SPLIT"); return e && atoi(e) != 0; }();
-            const bool split_head = dsv4_output_split && mo->arch == LLM_ARCH_DEEPSEEK4;
+            // also a DeepSeek V4 / V4.1 target whose vocabulary head is split over its devices (V4: LLAMA_DSV4_OUTPUT_SPLIT=1,
+            // V4.1: on unless LLAMA_DSV41_OUTPUT_SPLIT=0): the DSpark Markov head adds a whole-vocabulary bias to the draft's
+            // logits and takes their argmax, so the draft reads a private, mirrored copy of the head (V4: +563 MB per GPU;
+            // the target's verify keeps the split head)
+            static const bool dsv4_output_split  = [] { const char * e = getenv("LLAMA_DSV4_OUTPUT_SPLIT");  return e && atoi(e) != 0; }();
+            static const bool dsv41_output_split = [] { const char * e = getenv("LLAMA_DSV41_OUTPUT_SPLIT"); return !e || atoi(e) != 0; }();
+            const bool split_head = (dsv4_output_split && mo->arch == LLM_ARCH_DEEPSEEK4) ||
+                                    (dsv41_output_split && mo->arch == LLM_ARCH_DEEPSEEK41);
             std::vector<std::pair<const ggml_tensor *, ggml_tensor **>> todo;
             if (model.tok_embd == nullptr && !usable(mo->tok_embd)) {
                 todo.push_back({mo->tok_embd, &cparams.shared_tok_embd});
