@@ -26,18 +26,16 @@ designed for cards without matrix cores or fast interconnects.
 | [Qwen3.8 27B](docs/models/qwen3.8-27b.md) | 2 (TP2) | AR, MTP, images | Unsloth [UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_XL.gguf) · [MTP Q4_0](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/4ca720788d1e01f1bff70c033e0d0028fd02e502/MTP/mtp-Qwen3.8-27B-Q4_0.gguf) · [mmproj F16](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/4ca720788d1e01f1bff70c033e0d0028fd02e502/mmproj-F16.gguf) | **702 tok/s pp**; **69.5 tok/s tg** with MTP (43.9 AR) |
 | [Qwen3.8 Flash-Next, decode profile](docs/models/qwen3.8-flash-next.md#decode-profile-chat-agents) | 4 (two TP2 pairs) | AR, MTP, images | Unsloth [UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/38bb39ee97821de2c9009abb7e93950eec396e66/UD-Q4_K_XL) · [MTP Q8_0](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/38bb39ee97821de2c9009abb7e93950eec396e66/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf) · [mmproj F16](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/38bb39ee97821de2c9009abb7e93950eec396e66/mmproj-F16.gguf) | **1,939 tok/s pp**; **119.0 tok/s tg** with MTP (79.5 AR) |
 | [Qwen3.8 Flash-Next, prefill profile](docs/models/qwen3.8-flash-next.md#prefill-profile-long-prompts-documents) | 4 (layer split) | AR, MTP, images | Unsloth [UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/38bb39ee97821de2c9009abb7e93950eec396e66/UD-Q4_K_XL) · [MTP Q8_0](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/38bb39ee97821de2c9009abb7e93950eec396e66/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf) · [mmproj F16](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/38bb39ee97821de2c9009abb7e93950eec396e66/mmproj-F16.gguf) | **2,615 tok/s pp**; **79.1 tok/s tg** with MTP (52.3 AR) |
-| [GLM-5.3-Flash Q4](docs/models/glm-5.3-flash.md#q4-on-8-cards) | 8 (TP4×2) | AR, MTP, images | Unsloth [UD-Q4_K_XL](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF/tree/621d456e93e926e4b52f85cff5f634358c1828f9/UD-Q4_K_XL) | 1,210 tok/s pp; 55.0 tok/s tg AR† |
-| [DeepSeek V4.1 Flash](docs/models/deepseek-v4.1-flash.md) | 8 (TP4×2) | AR, images | vcruz305 [Q2_K](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF/tree/c4a085541cb53f67ee5e57b63d255e80cef286e7) · smalinin [mmproj BF16](https://huggingface.co/smalinin/DeepSeek-V4.1-Flash-GGUF/blob/fb2ce0313f74a0e1c3950cdf3e051c124dd0b39e/mmproj-DeepSeek-V4.1-Flash-BF16.gguf) | 1,218 tok/s pp; 79.3 tok/s tg AR† |
+| [GLM-5.3-Flash Q4](docs/models/glm-5.3-flash.md#q4-on-8-cards) | 8 (TP4×2) | AR, MTP, images | Unsloth [UD-Q4_K_XL](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF/tree/621d456e93e926e4b52f85cff5f634358c1828f9/UD-Q4_K_XL) | **1,299 tok/s pp**; **78.9 tok/s tg** with MTP (63.7 AR) |
+| [DeepSeek V4.1 Flash](docs/models/deepseek-v4.1-flash.md) | 8 (TP4×2) | AR, images | vcruz305 [Q2_K](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF/tree/c4a085541cb53f67ee5e57b63d255e80cef286e7) · smalinin [mmproj BF16](https://huggingface.co/smalinin/DeepSeek-V4.1-Flash-GGUF/blob/fb2ce0313f74a0e1c3950cdf3e051c124dd0b39e/mmproj-DeepSeek-V4.1-Flash-BF16.gguf) | **1,316 tok/s pp**; **85.7 tok/s tg** plain (86.4 AR) |
 
 **pp** is llama-bench prompt processing of a 2,048-token prompt. **AR** is plain autoregressive
-decoding (llama-bench, 128 tokens). The speculative **tg** numbers are the `llama-server`
-decode rate over [20 varied prompts](docs/BENCHMARKS.md#speculative-decoding-serving)
-of 200 greedy tokens each. Speculative speed depends on the text: code, lists and
-translations draft far better than stories. All numbers are for a single user, measured
-2026-10-05/06 on the current code. † Measured 2026-10-02 on an older build, from before most
-of the kernel and speculative-decoding work; the 8-card setups have not been re-verified
-since. Each model guide lists the exact command and settings, and
-[BENCHMARKS.md](docs/BENCHMARKS.md) has the full method.
+decoding (llama-bench, 128 tokens). The bold **tg** numbers are the `llama-server` decode
+rate over [20 varied prompts](docs/BENCHMARKS.md#speculative-decoding-serving) of 200
+greedy tokens each, with the model's drafter where it helps. Speculative speed depends on the
+text: code, lists and translations draft far better than stories. All numbers are for a
+single user, measured 2026-10-05/06 on the current code. Each model guide lists the exact
+command and settings, and [BENCHMARKS.md](docs/BENCHMARKS.md) has the full method.
 
 ## New features
 
