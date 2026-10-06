@@ -7,7 +7,7 @@ The dense Qwen3.8 27B, with Gated DeltaNet and full-attention layers and a visio
 | --- | --- |
 | Cards | 2 (TP2) |
 | Weights | [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/tree/4ca720788d1e01f1bff70c033e0d0028fd02e502) at revision `4ca72078`: `Qwen3.8-27B-UD-Q4_K_XL.gguf` (17.6 GB), `MTP/mtp-Qwen3.8-27B-Q4_0.gguf` (1.4 GB), `mmproj-F16.gguf` (0.9 GB) |
-| Speed | 702 tok/s prompt processing; 69.5 tok/s with MTP, 43.9 tok/s plain ([benchmarks](../BENCHMARKS.md)) |
+| Speed | 702 tok/s prompt processing; 69.5 tok/s with MTP, 43.9 tok/s plain ([benchmarks](../BENCHMARKS.md)); against stock llama.cpp: [Qwen3.8 27B benchmarks](qwen3.8-27b-benchmarks.md) |
 | Context | 64K by default |
 
 ## Download

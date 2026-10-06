@@ -11,3 +11,6 @@
 Each guide has the pinned download command, the serve command with every setting explained,
 measured speeds and known caveats. The [benchmark method](../BENCHMARKS.md) is the same for
 all of them.
+
+Against stock llama.cpp on the same cards: [Qwen3.8 27B benchmarks](qwen3.8-27b-benchmarks.md),
+measured with BetterBench.

@@ -37,6 +37,10 @@ text: code, lists and translations draft far better than stories. All numbers ar
 single user, measured 2026-10-05/06 on the current code. Each model guide lists the exact
 command and settings, and [BENCHMARKS.md](docs/BENCHMARKS.md) has the full method.
 
+**Against stock llama.cpp:** on Qwen3.8 27B, with the same model on the same kind of cards,
+Castagna Veloce decodes 23% faster and processes prompts 70–75% faster, as measured with
+BetterBench ([Qwen3.8 27B benchmarks](docs/models/qwen3.8-27b-benchmarks.md)).
+
 ## New features
 
 Everything below was written for Castagna Veloce, and none of it is in upstream llama.cpp

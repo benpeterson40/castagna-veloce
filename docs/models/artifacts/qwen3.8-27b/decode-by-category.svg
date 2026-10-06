@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 380" width="760" height="380" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif" role="img" aria-label="Qwen3.8 27B on 2 MI50s: decode by task (tok/s)">
+<rect x="0" y="0" width="760" height="380" rx="10" fill="#ffffff"/>
+<text x="64" y="30" font-size="17" font-weight="600" fill="#24292f">Qwen3.8 27B on 2 MI50s: decode by task (tok/s)</text>
+<rect x="64" y="44" width="12" height="12" fill="#8b949e"/><text x="82" y="55" font-size="13" fill="#24292f">stock llama.cpp</text>
+<rect x="214" y="44" width="12" height="12" fill="#e4572e"/><text x="232" y="55" font-size="13" fill="#24292f">Castagna Veloce</text>
+<line x1="64" y1="324.0" x2="740" y2="324.0" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="328.0" font-size="12" fill="#57606a" text-anchor="end">0</text>
+<line x1="64" y1="264.2" x2="740" y2="264.2" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="268.2" font-size="12" fill="#57606a" text-anchor="end">20</text>
+<line x1="64" y1="204.5" x2="740" y2="204.5" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="208.5" font-size="12" fill="#57606a" text-anchor="end">40</text>
+<line x1="64" y1="144.7" x2="740" y2="144.7" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="148.7" font-size="12" fill="#57606a" text-anchor="end">60</text>
+<line x1="64" y1="85.0" x2="740" y2="85.0" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="89.0" font-size="12" fill="#57606a" text-anchor="end">80</text>
+<text x="16" y="202.0" font-size="12" fill="#57606a" transform="rotate(-90 16 202.0)" text-anchor="middle">tokens per second</text>
+<rect x="75.5" y="179.1" width="28.7" height="144.9" fill="#8b949e" rx="2"/>
+<text x="89.9" y="174.1" font-size="11" fill="#24292f" text-anchor="middle">49</text>
+<rect x="108.2" y="144.7" width="28.7" height="179.3" fill="#e4572e" rx="2"/>
+<text x="122.6" y="139.7" font-size="11" fill="#24292f" text-anchor="middle">60</text>
+<text x="106.2" y="344.0" font-size="12" fill="#24292f" text-anchor="middle">code</text>
+<rect x="160.0" y="191.2" width="28.7" height="132.8" fill="#8b949e" rx="2"/>
+<text x="174.4" y="186.2" font-size="11" fill="#24292f" text-anchor="middle">44</text>
+<rect x="192.8" y="162.7" width="28.7" height="161.3" fill="#e4572e" rx="2"/>
+<text x="207.1" y="157.7" font-size="11" fill="#24292f" text-anchor="middle">54</text>
+<text x="190.8" y="344.0" font-size="12" fill="#24292f" text-anchor="middle">reasoning</text>
+<rect x="244.5" y="192.5" width="28.7" height="131.5" fill="#8b949e" rx="2"/>
+<text x="258.9" y="187.5" font-size="11" fill="#24292f" text-anchor="middle">44</text>
+<rect x="277.2" y="164.7" width="28.7" height="159.3" fill="#e4572e" rx="2"/>
+<text x="291.6" y="159.7" font-size="11" fill="#24292f" text-anchor="middle">53</text>
+<text x="275.2" y="344.0" font-size="12" fill="#24292f" text-anchor="middle">prose</text>
+<rect x="329.0" y="154.2" width="28.7" height="169.8" fill="#8b949e" rx="2"/>
+<text x="343.4" y="149.2" font-size="11" fill="#24292f" text-anchor="middle">57</text>
+<rect x="361.8" y="114.1" width="28.7" height="209.9" fill="#e4572e" rx="2"/>
+<text x="376.1" y="109.1" font-size="11" fill="#24292f" text-anchor="middle">70</text>
+<text x="359.8" y="344.0" font-size="12" fill="#24292f" text-anchor="middle">JSON</text>
+<rect x="413.5" y="162.2" width="28.7" height="161.8" fill="#8b949e" rx="2"/>
+<text x="427.9" y="157.2" font-size="11" fill="#24292f" text-anchor="middle">54</text>
+<rect x="446.2" y="119.8" width="28.7" height="204.2" fill="#e4572e" rx="2"/>
+<text x="460.6" y="114.8" font-size="11" fill="#24292f" text-anchor="middle">68</text>
+<text x="444.2" y="344.0" font-size="12" fill="#24292f" text-anchor="middle">file edits</text>
+<rect x="498.0" y="157.2" width="28.7" height="166.8" fill="#8b949e" rx="2"/>
+<text x="512.4" y="152.2" font-size="11" fill="#24292f" text-anchor="middle">56</text>
+<rect x="530.8" y="114.0" width="28.7" height="210.0" fill="#e4572e" rx="2"/>
+<text x="545.1" y="109.0" font-size="11" fill="#24292f" text-anchor="middle">70</text>
+<text x="528.8" y="344.0" font-size="12" fill="#24292f" text-anchor="middle">summarization</text>
+<rect x="582.5" y="187.3" width="28.7" height="136.7" fill="#8b949e" rx="2"/>
+<text x="596.9" y="182.3" font-size="11" fill="#24292f" text-anchor="middle">46</text>
+<rect x="615.2" y="154.6" width="28.7" height="169.4" fill="#e4572e" rx="2"/>
+<text x="629.6" y="149.6" font-size="11" fill="#24292f" text-anchor="middle">57</text>
+<text x="613.2" y="344.0" font-size="12" fill="#24292f" text-anchor="middle">chat</text>
+<rect x="667.0" y="158.0" width="28.7" height="166.0" fill="#8b949e" rx="2"/>
+<text x="681.4" y="153.0" font-size="11" fill="#24292f" text-anchor="middle">56</text>
+<rect x="699.8" y="111.8" width="28.7" height="212.2" fill="#e4572e" rx="2"/>
+<text x="714.1" y="106.8" font-size="11" fill="#24292f" text-anchor="middle">71</text>
+<text x="697.8" y="344.0" font-size="12" fill="#24292f" text-anchor="middle">math</text>
+<line x1="64" y1="324" x2="740" y2="324" stroke="#57606a" stroke-width="1"/>
+</svg>

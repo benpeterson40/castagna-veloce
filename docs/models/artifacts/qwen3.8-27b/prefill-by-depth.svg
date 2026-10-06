@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 380" width="760" height="380" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif" role="img" aria-label="Qwen3.8 27B on 2 MI50s: prompt processing (tok/s)">
+<rect x="0" y="0" width="760" height="380" rx="10" fill="#ffffff"/>
+<text x="64" y="30" font-size="17" font-weight="600" fill="#24292f">Qwen3.8 27B on 2 MI50s: prompt processing (tok/s)</text>
+<rect x="64" y="44" width="12" height="12" fill="#8b949e"/><text x="82" y="55" font-size="13" fill="#24292f">stock llama.cpp</text>
+<rect x="214" y="44" width="12" height="12" fill="#e4572e"/><text x="232" y="55" font-size="13" fill="#24292f">Castagna Veloce</text>
+<line x1="64" y1="324.0" x2="740" y2="324.0" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="328.0" font-size="12" fill="#57606a" text-anchor="end">0</text>
+<line x1="64" y1="249.0" x2="740" y2="249.0" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="253.0" font-size="12" fill="#57606a" text-anchor="end">200</text>
+<line x1="64" y1="174.0" x2="740" y2="174.0" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="178.0" font-size="12" fill="#57606a" text-anchor="end">400</text>
+<line x1="64" y1="98.9" x2="740" y2="98.9" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="102.9" font-size="12" fill="#57606a" text-anchor="end">600</text>
+<text x="16" y="202.0" font-size="12" fill="#57606a" transform="rotate(-90 16 202.0)" text-anchor="middle">tokens per second</text>
+<rect x="83.6" y="211.0" width="46.0" height="113.0" fill="#8b949e" rx="2"/>
+<text x="106.6" y="206.0" font-size="11" fill="#24292f" text-anchor="middle">301</text>
+<rect x="133.6" y="126.2" width="46.0" height="197.8" fill="#e4572e" rx="2"/>
+<text x="156.6" y="121.2" font-size="11" fill="#24292f" text-anchor="middle">527</text>
+<text x="131.6" y="344.0" font-size="12" fill="#24292f" text-anchor="middle">1.6K</text>
+<rect x="218.8" y="201.2" width="46.0" height="122.8" fill="#8b949e" rx="2"/>
+<text x="241.8" y="196.2" font-size="11" fill="#24292f" text-anchor="middle">327</text>
+<rect x="268.8" y="111.8" width="46.0" height="212.2" fill="#e4572e" rx="2"/>
+<text x="291.8" y="106.8" font-size="11" fill="#24292f" text-anchor="middle">566</text>
+<text x="266.8" y="344.0" font-size="12" fill="#24292f" text-anchor="middle">5.9K</text>
+<rect x="354.0" y="202.8" width="46.0" height="121.2" fill="#8b949e" rx="2"/>
+<text x="377.0" y="197.8" font-size="11" fill="#24292f" text-anchor="middle">323</text>
+<rect x="404.0" y="114.0" width="46.0" height="210.0" fill="#e4572e" rx="2"/>
+<text x="427.0" y="109.0" font-size="11" fill="#24292f" text-anchor="middle">560</text>
+<text x="402.0" y="344.0" font-size="12" fill="#24292f" text-anchor="middle">11.8K</text>
+<rect x="489.2" y="208.1" width="46.0" height="115.9" fill="#8b949e" rx="2"/>
+<text x="512.2" y="203.1" font-size="11" fill="#24292f" text-anchor="middle">309</text>
+<rect x="539.2" y="124.9" width="46.0" height="199.1" fill="#e4572e" rx="2"/>
+<text x="562.2" y="119.9" font-size="11" fill="#24292f" text-anchor="middle">531</text>
+<text x="537.2" y="344.0" font-size="12" fill="#24292f" text-anchor="middle">23.6K</text>
+<rect x="624.4" y="218.0" width="46.0" height="106.0" fill="#8b949e" rx="2"/>
+<text x="647.4" y="213.0" font-size="11" fill="#24292f" text-anchor="middle">283</text>
+<rect x="674.4" y="144.1" width="46.0" height="179.9" fill="#e4572e" rx="2"/>
+<text x="697.4" y="139.1" font-size="11" fill="#24292f" text-anchor="middle">480</text>
+<text x="672.4" y="344.0" font-size="12" fill="#24292f" text-anchor="middle">47.1K</text>
+<line x1="64" y1="324" x2="740" y2="324" stroke="#57606a" stroke-width="1"/>
+</svg>

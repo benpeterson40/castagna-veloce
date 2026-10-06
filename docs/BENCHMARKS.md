@@ -3,6 +3,9 @@
 All numbers are for one user and one request at a time, on the system below. Each
 [model guide](models) has the exact serve command used.
 
+For a head-to-head comparison with stock llama.cpp on the same cards, see
+[Qwen3.8 27B benchmarks](models/qwen3.8-27b-benchmarks.md), measured with BetterBench.
+
 ## Test system
 
 | Part | Details |
