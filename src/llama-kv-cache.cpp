@@ -260,8 +260,11 @@ llama_kv_cache::llama_kv_cache(
                 continue;
             }
 
-            if (filter && !filter(il)) {
-                LLAMA_LOG_DEBUG("%s: - layer %3d: filtered\n", __func__, il);
+            // A layer the filter rejected has no storage of its own, which is the case that most
+            // needs to borrow another layer's. Owning storage and reading storage are separate
+            // questions, so only a layer with no KV at all is skipped here.
+            if (!hparams.has_kv(il)) {
+                LLAMA_LOG_DEBUG("%s: - layer %3d: does not have KV cache\n", __func__, il);
                 continue;
             }
 
@@ -325,7 +328,7 @@ llama_kv_cache::llama_kv_cache(
             hparams.n_embd_head_k() % 64 == 0;
 
         // always create Hadamard rotation tensors for DeepSeek lightning indexers
-        if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 ||
+        if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_DEEPSEEK41 ||
                 model.arch == LLM_ARCH_GLM_DSA || model.arch == LLM_ARCH_DOTS3NOTE) &&
                 hparams.n_embd_head_k_full == hparams.indexer_head_size) {
             attn_rot_k = true;
@@ -1216,6 +1219,18 @@ bool llama_kv_cache::get_has_shift() const {
     return result;
 }
 
+void llama_kv_cache::set_kpool_dirty() {
+    kpool_dirty = true;
+}
+
+bool llama_kv_cache::get_kpool_dirty() const {
+    return kpool_dirty;
+}
+
+void llama_kv_cache::clear_kpool_dirty() const {
+    kpool_dirty = false;
+}
+
 ggml_type llama_kv_cache::type_k() const {
     return layers[0].k->type;
 }
@@ -1350,6 +1365,30 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     return ggml_set_rows(ctx, k, k_cur, k_idxs);
 }
 
+ggml_tensor * llama_kv_cache::cpy_k_part(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il,
+        int64_t n_embd, int64_t i_off) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    ggml_tensor * k = layers[ikv].k;
+
+    const int64_t n_embd_gqa = k->ne[0];
+    const int64_t kv_size    = get_size();
+    const int64_t n_stream   = k->ne[2];
+
+    GGML_ASSERT(i_off >= 0 && i_off + n_embd <= n_embd_gqa);
+    GGML_ASSERT(k_cur->ne[0] == n_embd);
+
+    // merge the streams: k_idxs are global, exactly as in cpy_k
+    ggml_tensor * k2 = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size*n_stream);
+
+    // a row-slice view of every cell. ggml_set_rows needs contiguous rows in the DEST,
+    // which ggml_is_contiguous_rows() grants for a view whose ne[0] slice is contiguous.
+    ggml_tensor * dst = ggml_view_2d(ctx, k2, n_embd, kv_size*n_stream,
+            k2->nb[1], ggml_row_size(k2->type, i_off));
+
+    return ggml_set_rows(ctx, dst, k_cur, k_idxs);
+}
+
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
 
@@ -1435,7 +1474,9 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
-    if (attn_rot_k) {
+    // a cache with no layers leaves n_embd_head_k_all at 0, and every nrot divides 0, so the
+    // search below would never end. there is nothing to rotate in that case anyway.
+    if (attn_rot_k && n_embd_head_k_all > 0) {
         int nrot = 64;
 
         // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
@@ -1829,8 +1870,8 @@ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
 }
 
 bool llama_kv_cache::has_cell_ext() const {
-    // M-RoPE needs the 2D position, the PLE n-gram hash needs the token id
-    return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
+    // M-RoPE needs the 2D position, the PLE and engram n-gram hashes need the token id
+    return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0 || hparams.engram_n_head > 0;
 }
 
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
@@ -2750,6 +2791,22 @@ ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
 }
 
+uint32_t llama_kv_cache_context::get_n_stream() const {
+    return sinfos[i_cur].s1 - sinfos[i_cur].s0 + 1;
+}
+
+uint32_t llama_kv_cache_context::get_strm(uint32_t s) const {
+    const auto & sinfo = sinfos[i_cur];
+
+    GGML_ASSERT(s < sinfo.strm.size());
+
+    return sinfo.strm[s];
+}
+
+const llama_kv_cache * llama_kv_cache_context::get_kv() const {
+    return kv;
+}
+
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
     return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
 }
@@ -2760,6 +2817,11 @@ ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) cons
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_k_part(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il,
+        int64_t n_embd, int64_t i_off) const {
+    return kv->cpy_k_part(ctx, k_cur, k_idxs, il, n_embd, i_off);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {

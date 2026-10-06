@@ -47,6 +47,7 @@ struct llama_cparams {
     bool fused_dsv4_hc_pre;
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
+    bool fused_dsv4_hc_mix;  // whole HC coefficient chain as one op (LLAMA_DSV4_HC_MIX=0 off)
     bool auto_fhc;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
@@ -64,4 +65,10 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+
+    // drafts that borrow the target's tok_embd / output (DFlash, DSpark, EAGLE3): private copies on the draft's own
+    // device when the target's tensors sit in a buffer this context's backends cannot use (target under -sm tensor)
+    ggml_tensor * shared_tok_embd = nullptr;
+    ggml_tensor * shared_output   = nullptr;
+    ggml_tensor * shared_output_s = nullptr;
 };

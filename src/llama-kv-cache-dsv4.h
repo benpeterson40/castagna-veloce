@@ -20,6 +20,7 @@ public:
             bool            unified,
             uint32_t        n_seq_max,
             uint32_t        ratio,
+                bool        overlap,
             uint32_t        state_size,
             uint32_t        n_embd_state,
             uint32_t        n_rs_seq,
@@ -31,6 +32,7 @@ public:
     void apply_copies(const stream_copy_info & sc_info) const;
 
     uint32_t get_ratio()      const;
+    bool     get_overlap()    const;
     uint32_t get_state_size() const;
     uint32_t get_n_stream()   const;
     uint32_t get_n_rs_seq()   const;
@@ -61,6 +63,8 @@ private:
     };
 
     const uint32_t ratio;
+    // whether a pooled group overlaps the previous one; V4's CSA does, V4.1's compressor does not
+    const bool     overlap;
     const uint32_t state_size;
     const uint32_t n_embd_state;
     const uint32_t n_stream;
@@ -152,7 +156,16 @@ public:
     const std::vector<uint32_t> & get_rs_idx() const;
     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
 
+    // V4.1 Causal Encoder-Decoder prefill (CED, LLAMA_DSV41_CED): a prompt's tokens run only the encoder layers, which
+    // also write the decoder's global KV; the decoder replays the last ced_n_win (= the SWA window) tokens. 0: off
+    uint32_t get_ced_n_win() const { return ced_n_win; }
+    // per SWA stream and cell: 1 when the decoder layers wrote the cell's raw KV (their attention masks the others)
+    std::vector<std::vector<uint8_t>> * get_swa_dec_valid() { return &swa_dec_valid; }
+
 private:
+    uint32_t ced_n_win = 0;
+    std::vector<std::vector<uint8_t>> swa_dec_valid;
+
     llama_hparams hparams_raw;
     llama_hparams hparams_csa;
     llama_hparams hparams_hca;
@@ -212,10 +225,24 @@ public:
 
     void set_input_k_idxs(ggml_tensor * dst) const;
     void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    // CED: the SWA mask of the decoder layers (cells the decoder has not written are masked)
+    void set_input_kq_mask_dec(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_k_rot(ggml_tensor * dst) const;
+
+    // see llama_kv_cache::get_prev_tokens(); the engram n-gram hash needs the preceding tokens
+    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+
+    // CED bookkeeping: the decoder-written flags of the SWA cells and how many leading ubatches are encoder-only
+    void set_ced(std::vector<std::vector<uint8_t>> * dec_valid, size_t n_enc_ub) {
+        this->dec_valid = dec_valid;
+        this->n_ced_enc_ub = n_enc_ub;
+    }
 
 private:
     size_t i_next = 0;
+
+    std::vector<std::vector<uint8_t>> * dec_valid = nullptr;
+    size_t n_ced_enc_ub = 0;
 
     llama_kv_cache * kv_swa = nullptr;
 
@@ -337,7 +364,8 @@ public:
             slot_info_vec_t sinfos_raw_swa_write,
             slot_info_vec_t sinfos_raw_swa_read,
             std::vector<llama_ubatch> ubatches,
-            std::vector<llama_ubatch> ubatches_raw);
+            std::vector<llama_ubatch> ubatches_raw,
+            size_t n_ced_enc_ub = 0);
 
     virtual ~llama_kv_cache_dsv4_context();
 
@@ -371,8 +399,14 @@ public:
     const comp_plan & get_hca_plan(const llama_ubatch & ubatch) const;
     const comp_plan & get_lid_plan(const llama_ubatch & ubatch) const;
 
+    // CED: the current ubatch runs only the encoder (and the decoder's global KV); the window size (0: CED off)
+    bool     ced_enc_only()  const { return i_next < n_ced_enc_ub; }
+    uint32_t get_ced_n_win() const { return ced_n_win; }
+
 private:
     size_t i_next = 0;
+    size_t n_ced_enc_ub = 0;
+    uint32_t ced_n_win = 0;
 
     std::vector<llama_ubatch> ubatches;
 

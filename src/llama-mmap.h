@@ -55,6 +55,11 @@ struct llama_mmap {
 
     void unmap_fragment(size_t first, size_t last);
 
+    // fault the lazy ranges in (after the weights are loaded, so that they are the most recently used file pages)
+    void populate_lazy();
+    // fault the given byte ranges in (MADV_POPULATE_READ, 16 threads); returns bytes populated
+    size_t populate(const ranges & r);
+
     static const bool SUPPORTED;
 
 private:

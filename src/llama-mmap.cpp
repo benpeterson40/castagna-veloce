@@ -1,5 +1,8 @@
 #include "llama-mmap.h"
 
+#include <atomic>
+#include <thread>
+
 #include "llama-impl.h"
 
 #include "ggml.h"
@@ -476,13 +479,47 @@ struct llama_mmap::impl {
             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
                     strerror(errno));
         }
-        // MAP_POPULATE would fault in the lazy ranges too
-        if (prefetch && lazy_ranges.empty()) { flags |= MAP_POPULATE; }
+        // MAP_POPULATE would fault in the lazy ranges too. LLAMA_MMAP_POPULATE_THREADS=N (default 8): populate with N
+        // threads (MADV_POPULATE_READ, Linux 5.14+) instead: MAP_POPULATE faults the pages in one thread inside mmap()
+        // (17.6 GB from tmpfs: 1.3 s); 1 = MAP_POPULATE
+        // 0 (default) = no populate: the pages fault in during the uploads instead, which with the staged, per-GPU
+        // parallel uploads is faster (Qwen3.8-27B TP2 launch 5.75 -> 5.2 s; the staging memcpy faults pages on the
+        // uploader threads in parallel)
+        static const int populate_threads = [] {
+            const char * e = getenv("LLAMA_MMAP_POPULATE_THREADS");
+            return e ? std::max(0, atoi(e)) : 0;
+        }();
+        const bool populate = prefetch && lazy_ranges.empty() && populate_threads > 0;
+        if (populate && populate_threads <= 1) { flags |= MAP_POPULATE; }
 #endif
         addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
+#ifdef __linux__
+        if (populate && populate_threads > 1) {
+            const size_t page = sysconf(_SC_PAGESIZE);
+            const size_t n    = file->size();
+            const size_t per  = ((n + populate_threads - 1)/populate_threads + page - 1) & ~(page - 1);
+            std::vector<std::thread> workers;
+            std::atomic<bool> failed{false};
+            for (int i = 0; i < populate_threads && (size_t) i*per < n; ++i) {
+                workers.emplace_back([&, i] {
+                    const size_t beg = (size_t) i*per;
+                    const size_t len = std::min(per, n - beg);
+                    if (madvise((char *) addr + beg, len, 22 /* MADV_POPULATE_READ */) != 0) {
+                        failed = true;
+                    }
+                });
+            }
+            for (auto & w : workers) {
+                w.join();
+            }
+            if (failed) {
+                LLAMA_LOG_DEBUG("%s: MADV_POPULATE_READ failed, pages fault in on first use\n", __func__);
+            }
+        }
+#endif
 
         // page-aligned madvise over [beg, end), clamped to the file
         auto advise = [&](size_t beg, size_t end, int advice, const char * name) {
@@ -505,6 +542,27 @@ struct llama_mmap::impl {
         for (const auto & range : lazy_ranges) {
             advise(range.first, range.second, POSIX_MADV_RANDOM, "POSIX_MADV_RANDOM");
         }
+#ifdef __linux__
+        // lazy ranges are read row by row on demand (DeepSeek V4.1's engram tables, ~65 GB): with a cold page cache every
+        // prompt faults its rows in from disk inside the CPU get_rows (server prefill 2.5x slower than warm).
+        // LLAMA_LAZY_PREFETCH: 2 (default) populate them after the weights are loaded (populate_lazy(), called by the
+        // loader: loading the weights through the page cache otherwise evicts rows prefetched early), 1 background
+        // readahead at mmap time, 0 off.
+        lazy = lazy_ranges;
+        if (lazy_prefetch_mode() == 1 && !lazy_ranges.empty()) {
+            const int fd_dup = dup(fd);
+            if (fd_dup >= 0) {
+                prefetch_thread = std::thread([fd_dup, ranges = lazy_ranges] {
+                    for (const auto & r : ranges) {
+                        if (r.second > r.first) {
+                            (void) posix_fadvise(fd_dup, (off_t) r.first, (off_t) (r.second - r.first), POSIX_FADV_WILLNEED);
+                        }
+                    }
+                    close(fd_dup);
+                });
+            }
+        }
+#endif
         if (numa) {
             if (posix_madvise(addr, file->size(), POSIX_MADV_RANDOM)) {
                 LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_RANDOM) failed: %s\n",
@@ -563,7 +621,77 @@ struct llama_mmap::impl {
         mapped_fragments = std::move(new_mapped_fragments);
     }
 
+    std::thread prefetch_thread;
+    llama_mmap::ranges lazy;
+
+    static int lazy_prefetch_mode() {
+        static const int mode = [] { const char * e = getenv("LLAMA_LAZY_PREFETCH"); return e ? atoi(e) : 2; }();
+        return mode;
+    }
+
+    void populate_lazy() {
+#ifdef __linux__
+        if (lazy_prefetch_mode() != 2 || lazy.empty()) {
+            return;
+        }
+        const int64_t t0 = ggml_time_us();
+        const size_t total = populate(lazy);
+        const double dt = (ggml_time_us() - t0)/1e6;
+        LLAMA_LOG_INFO("%s: populated %.2f GB of lazily read tensors in %.1f s\n", __func__, total/1e9, dt);
+        if (getenv("LLAMA_LAZY_PREFETCH_DEBUG")) {
+            fprintf(stderr, "populate_lazy: %.2f GB in %.1f s\n", total/1e9, dt);
+        }
+#endif
+    }
+
+    size_t populate(const llama_mmap::ranges & ranges) {
+        size_t total = 0;
+#ifdef __linux__
+        const size_t page  = sysconf(_SC_PAGESIZE);
+        const size_t chunk = 64u << 20;
+        std::vector<std::pair<size_t, size_t>> chunks;
+        for (const auto & r : ranges) {
+            const size_t beg = r.first & ~(page - 1);
+            const size_t end = std::min((r.second + page - 1) & ~(page - 1), size);
+            for (size_t o = beg; o < end; o += chunk) {
+                chunks.push_back({o, std::min(end, o + chunk)});
+            }
+        }
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> workers;
+        for (int t = 0; t < 16; ++t) {
+            workers.emplace_back([&] {
+                for (size_t j; (j = next.fetch_add(1)) < chunks.size(); ) {
+                    char * p = (char *) addr + chunks[j].first;
+                    const size_t len = chunks[j].second - chunks[j].first;
+                    (void) posix_madvise(p, len, POSIX_MADV_SEQUENTIAL);
+                    if (madvise(p, len, 22 /* MADV_POPULATE_READ */) != 0) {
+                        volatile char sink = 0;
+                        for (size_t o = 0; o < len; o += page) {
+                            sink ^= p[o];
+                        }
+                        (void) sink;
+                    }
+                    (void) posix_madvise(p, len, POSIX_MADV_RANDOM);
+                }
+            });
+        }
+        for (auto & w : workers) {
+            w.join();
+        }
+        for (const auto & c : chunks) {
+            total += c.second - c.first;
+        }
+#else
+        GGML_UNUSED(ranges);
+#endif
+        return total;
+    }
+
     ~impl() {
+        if (prefetch_thread.joinable()) {
+            prefetch_thread.join();
+        }
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
                 LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
@@ -671,6 +799,8 @@ size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+void llama_mmap::populate_lazy() { pimpl->populate_lazy(); }
+size_t llama_mmap::populate(const ranges & r) { return pimpl->populate(r); }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;

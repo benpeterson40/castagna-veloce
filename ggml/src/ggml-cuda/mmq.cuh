@@ -959,11 +959,17 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx, const int2 * __restrict__ tile_map) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
         NO_DEVICE_CODE;
+        return;
+    }
+
+    // MoE tile map (tiled path only): blockIdx.y indexes a compact list of (expert, column tile) pairs,
+    // so the grid holds only tiles that contain tokens. Entries past the end are marked with x = -1.
+    if (tile_map && tile_map[blockIdx.y].x < 0) {
         return;
     }
 
@@ -991,10 +997,20 @@ static __global__ void mul_mat_q(
     __syncthreads();
 
     if constexpr (!ggml_cuda_mmq_get_stream_k(type, J, fallback)) {
-        const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
-        const int wt = tmp2.x;
-        const int zt = tmp2.y;
-        const int jt = blockIdx.y;
+        int wt;
+        int zt;
+        int jt;
+        if (tile_map) {
+            const int2 t = tile_map[blockIdx.y];
+            wt = 0;
+            zt = t.x;
+            jt = t.y;
+        } else {
+            const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
+            wt = tmp2.x;
+            zt = tmp2.y;
+            jt = blockIdx.y;
+        }
         const int it = blockIdx.x;
 
         // Defaults for regular matrix multiplication:
@@ -1392,6 +1408,48 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+// Build the MoE tile map: for each expert e with n_e = bounds[e+1] - bounds[e] rows, emit ceil(n_e/J)
+// entries (e, jt) in expert order, then mark the rest of the n_tiles_ub entries with x = -1.
+// One block; each thread owns a contiguous chunk of experts, followed by a block-wide exclusive scan.
+static constexpr int MMQ_TILE_MAP_THREADS = 256;
+
+static __global__ void mmq_build_tile_map(
+        const int32_t * __restrict__ expert_bounds, const int n_experts, const int J,
+        int2 * __restrict__ tile_map, const int n_tiles_ub) {
+    __shared__ int scan[MMQ_TILE_MAP_THREADS];
+
+    const int tid   = threadIdx.x;
+    const int chunk = (n_experts + MMQ_TILE_MAP_THREADS - 1) / MMQ_TILE_MAP_THREADS;
+    const int e0    = min(tid*chunk, n_experts);
+    const int e1    = min(e0 + chunk, n_experts);
+
+    int local = 0;
+    for (int e = e0; e < e1; ++e) {
+        local += (expert_bounds[e + 1] - expert_bounds[e] + J - 1) / J;
+    }
+
+    scan[tid] = local;
+    __syncthreads();
+    for (int off = 1; off < MMQ_TILE_MAP_THREADS; off *= 2) {
+        const int v = tid >= off ? scan[tid - off] : 0;
+        __syncthreads();
+        scan[tid] += v;
+        __syncthreads();
+    }
+    const int total = scan[MMQ_TILE_MAP_THREADS - 1];
+    int pos = scan[tid] - local; // exclusive prefix
+
+    for (int e = e0; e < e1; ++e) {
+        const int nt = (expert_bounds[e + 1] - expert_bounds[e] + J - 1) / J;
+        for (int t = 0; t < nt; ++t) {
+            tile_map[pos++] = make_int2(e, t);
+        }
+    }
+    for (int i = total + tid; i < n_tiles_ub; i += MMQ_TILE_MAP_THREADS) {
+        tile_map[i] = make_int2(-1, -1);
+    }
+}
+
 template <ggml_type type, int J, bool fallback>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -1427,12 +1485,29 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
-        mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+        // MoE: launch only tiles that hold tokens. Without a map the grid is n_experts * ceil(n_tokens/J)
+        // column tiles, and with ~10 tokens per expert almost all of them exit immediately.
+        // Upper bound on sum_e ceil(n_e/J): ceil(n_rows/J) + n_experts. GGML_MMQ_NO_TILE_MAP=1 disables it.
+        static const bool no_tile_map = [] {
+            const char * s = getenv("GGML_MMQ_NO_TILE_MAP");
+            return s && atoi(s) != 0;
+        }();
+        ggml_cuda_pool_alloc<int2> tile_map(ctx.pool(id));
+        dim3 grid = block_nums_xy_tiling;
+        if (args.expert_bounds && args.nsamples_y == 1 && !no_tile_map) {
+            const int n_experts  = args.nchannels_y;
+            const int n_tiles_ub = (args.ncols_y + config.J - 1) / config.J + n_experts;
+            tile_map.alloc(n_tiles_ub);
+            mmq_build_tile_map<<<1, MMQ_TILE_MAP_THREADS, 0, stream>>>(
+                args.expert_bounds, n_experts, config.J, tile_map.ptr, n_tiles_ub);
+            grid = dim3(nty, n_tiles_ub, 1);
+        }
+        mul_mat_q<type, J, fallback><<<grid, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, tile_map.ptr);
         return;
     }
 
@@ -1461,7 +1536,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd);
+         ntx_fd, nullptr);
 
     if (!fixup_needed) {
         return;
@@ -1472,6 +1547,26 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
          args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
          ntx_fd);
+}
+
+// GCN dense matmuls with 9..32 tokens that run faster with 32-wide tiles and a 4-way K split (see mul_mat_q_switch_J);
+// q4_K/q5_K/q6_K only above 16 tokens, q3_K never (its 32-wide config is 3x slower). GGML_MMQ_GCN_SMALL_N=0 off.
+static bool ggml_cuda_mmq_gcn_small_n(const int cc, const ggml_type type, const bool moe, const int64_t n) {
+    static const int env = [] { const char * e = getenv("GGML_MMQ_GCN_SMALL_N"); return e ? atoi(e) : 1; }();
+    if (!env || !GGML_CUDA_CC_IS_GCN(cc) || moe || n <= 8 || n > 32) {
+        return false;
+    }
+    switch (type) {
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ4_NL:
+            return true;
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return n > 16;
+        default:
+            return false;
+    }
 }
 
 template <ggml_type type, bool fallback>
@@ -1499,6 +1594,42 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             J_best = J;
             ntiles_J_best = ntiles_x;
         }
+    }
+    // GCN, short-K MoE (the down projection, K = 640) with few tokens per expert: 32-wide tiles beat both the widest
+    // tile (picked from the token count) and the per-expert average (whole model, 8x MI50, pp2048 ub384: 1317 -> 1430 t/s)
+    if (GGML_CUDA_CC_IS_GCN(cc) && args.expert_bounds != nullptr && args.ncols_x < 2048 &&
+            args.ncols_y <= 16*args.nchannels_y && ggml_cuda_mmq_get_config(type, 32, fallback, cc).type != GGML_TYPE_COUNT) {
+        J_best = 32;
+    }
+    // GCN, dense, 9..32 tokens (speculative verification of several sequences, small batches): 32-wide tiles with the
+    // K split in 4 (ggml_cuda_mmq_gcn_small_n) instead of 16/24-wide tiles over 68-136 row tiles: 8704x5120 at 16/24 tokens
+    // iq4_xs 602/671 -> 327/331 us, iq4_nl 594/652 -> 318/322, at 24 tokens q5_K 873 -> 436, q4_K 419 -> 288, q6_K 646 -> 553
+    if (ggml_cuda_mmq_gcn_small_n(cc, type, args.expert_bounds != nullptr, args.ncols_y) &&
+            ggml_cuda_mmq_get_config(type, 32, fallback, cc).type != GGML_TYPE_COUNT) {
+        J_best = 32;
+    }
+    // GGML_MMQ_DENSE_J=<J>: force the tile width of dense matmuls (experiments)
+    static const int dense_j_env = [] { const char * e = getenv("GGML_MMQ_DENSE_J"); return e ? atoi(e) : 0; }();
+    if (dense_j_env > 0 && args.expert_bounds == nullptr && dense_j_env % 8 == 0 && dense_j_env <= 128 &&
+            ggml_cuda_mmq_get_config(type, dense_j_env, fallback, cc).type != GGML_TYPE_COUNT) {
+        J_best = dense_j_env;
+    }
+    // GGML_MMQ_MOE_J=<J>: force the MoE tile width (experiments)
+    static const int moe_j_env = [] { const char * e = getenv("GGML_MMQ_MOE_J"); return e ? atoi(e) : 0; }();
+    if (moe_j_env > 0 && args.expert_bounds != nullptr && moe_j_env % 8 == 0 && moe_j_env <= 128 &&
+            ggml_cuda_mmq_get_config(type, moe_j_env, fallback, cc).type != GGML_TYPE_COUNT) {
+        J_best = moe_j_env;
+    }
+    // GGML_MMQ_MOE_J_SHORTK=<J>: same, only for short-K MoE matmuls (the down projection, K < 2048)
+    static const int moe_j_shortk_env = [] { const char * e = getenv("GGML_MMQ_MOE_J_SHORTK"); return e ? atoi(e) : 0; }();
+    if (moe_j_shortk_env > 0 && args.expert_bounds != nullptr && args.ncols_x < 2048 && moe_j_shortk_env % 8 == 0 &&
+            moe_j_shortk_env <= 128 && ggml_cuda_mmq_get_config(type, moe_j_shortk_env, fallback, cc).type != GGML_TYPE_COUNT) {
+        J_best = moe_j_shortk_env;
+    }
+    static const int moe_j_longk_env = [] { const char * e = getenv("GGML_MMQ_MOE_J_LONGK"); return e ? atoi(e) : 0; }();
+    if (moe_j_longk_env > 0 && args.expert_bounds != nullptr && args.ncols_x >= 2048 && moe_j_longk_env % 8 == 0 &&
+            moe_j_longk_env <= 128 && ggml_cuda_mmq_get_config(type, moe_j_longk_env, fallback, cc).type != GGML_TYPE_COUNT) {
+        J_best = moe_j_longk_env;
     }
 
     switch (J_best) {

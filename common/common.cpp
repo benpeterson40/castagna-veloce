@@ -1537,6 +1537,25 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         }
         if (llama_model_has_decoder(model)) {
             llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch)));
+
+            // LLAMA_WARMUP_PREFILL (default 1): also run a prompt-sized batch (two ubatches when n_batch allows) and one
+            // decode step after it, so the first request does not pay for lazy kernel loading, BLAS init and compute
+            // pool growth on the prefill path (GLM-5.3 Q4, 8 MI50s: first 7.7K-token prefill 8.98 s vs 7.12 s warm)
+            static const bool warm_pp = [] { const char * e = getenv("LLAMA_WARMUP_PREFILL"); return !e || atoi(e) != 0; }();
+            const uint32_t n_ub  = llama_n_ubatch(lctx);
+            const uint32_t n_b   = llama_n_batch(lctx);
+            const uint32_t n_ctx = llama_n_ctx(lctx);
+            const int32_t  n_pp  = (int32_t) std::min<uint32_t>(std::min(n_b, 2*n_ub), n_ctx > 16 ? n_ctx - 16 : 0);
+            if (warm_pp && !llama_model_has_encoder(model) && n_pp > (int32_t) tmp.size()) {
+                llama_memory_clear(llama_get_memory(lctx), true);
+                std::vector<llama_token> pp(n_pp);
+                for (int32_t i = 0; i < n_pp; ++i) {
+                    pp[i] = tmp[i % tmp.size()];
+                }
+                llama_decode(lctx, llama_batch_get_one(pp.data(), n_pp));
+                llama_token next = tmp[0];
+                llama_decode(lctx, llama_batch_get_one(&next, 1));
+            }
         }
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);

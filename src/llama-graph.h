@@ -33,6 +33,8 @@ class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
 
+class llm_graph_input_kpool;
+
 // certain models (typically multi-modal) can produce different types of graphs
 enum llm_graph_type {
     LLM_GRAPH_TYPE_DEFAULT,
@@ -49,6 +51,7 @@ enum llm_fused_op {
     LLM_FUSED_OP_DSV4_HC_PRE,
     LLM_FUSED_OP_DSV4_HC_COMB,
     LLM_FUSED_OP_DSV4_HC_POST,
+    LLM_FUSED_OP_DSV4_HC_MIX,
 };
 
 enum llm_ffn_op_type : int {
@@ -135,6 +138,10 @@ public:
 
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
+
+    // token embedding table in host memory: set_input gathers the token rows into embd (no CPU get_rows split)
+    const ggml_tensor * tok_embd_host = nullptr;
+    std::vector<float>  host_buf;
 
     const int64_t n_embd = 0;
 };
@@ -581,11 +588,14 @@ public:
 
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
+    // the decoder layers' SWA mask under CED (cells without decoder KV masked); the shared mask otherwise
+    ggml_tensor * get_kq_mask_dec() const { return self_kq_mask_dec ? self_kq_mask_dec : self_kq_mask_cnv; }
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask_dec = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
     ggml_tensor * self_k_rot = nullptr;
 
@@ -637,6 +647,9 @@ public:
     comp_input inp_csa;
     comp_input inp_hca;
     comp_input inp_lid;
+
+    // CED: the graph was built for an encoder-only ubatch (a different graph from a full one)
+    bool ced_enc_only = false;
 
     const llama_cparams cparams;
 
@@ -1358,6 +1371,30 @@ struct llm_graph_context {
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
+
+    // one pooling map per ubatch (see llama-kv-cache-kpool.h); `scoring` false gives only k_idxs
+    llm_graph_input_kpool * build_inp_kpool(
+            const llama_memory_hybrid_context * mctx_cur,
+            ggml_tensor * kq_mask,
+            bool scoring) const;
+
+    // build_attn, but masking with `top_k` over `sel_mask`; `cand_mask` drops over-budget picks
+    ggml_tensor * build_attn_sparse(
+            llm_graph_input_attn_k * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur,     // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k_cur,     // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur,     // [n_embd_head_v, n_head_v, n_tokens]
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks,     // [n_head_q]
+            ggml_tensor * v_mla,     // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+            ggml_tensor * top_k,     // I32 [n_select, n_tokens/n_stream, n_stream]
+            ggml_tensor * sel_mask,  // F16/F32 [n_kv, n_batch, 1, n_stream]
+            ggml_tensor * cand_mask, // F16/F32 [n_kv, n_batch, 1, n_stream]
+                  float   kq_scale,
+                    int   il) const;
 
     //
     // pooling

@@ -154,6 +154,34 @@ int64_t llama_time_us(void) {
     return ggml_time_us();
 }
 
+// -sm tensor with LLAMA_TP_GROUP=g (g divides the device count): one meta device per group of g consecutive devices,
+// tensor parallel inside a group and the layers pipelined across the groups as with -sm layer (e.g. 4 GPUs as 2+2).
+// Unset or 0: a single group over all devices.
+static std::vector<ggml_backend_dev_t> llama_tp_group_metas(llama_model * model, ggml_backend_dev_t * devs, size_t n_devs) {
+    // default: pairs when there are 4+ devices (a single group over more than 2 devices needs peer access or a slow
+    // fallback reduction); LLAMA_TP_GROUP=0 forces one group
+    const char * e = getenv("LLAMA_TP_GROUP");
+    size_t g = e ? (size_t) atoi(e) : (n_devs >= 4 && n_devs % 2 == 0 ? 2 : 0);
+    if (g == 0 || g > n_devs || n_devs % g != 0) {
+        if (g != 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_TP_GROUP=%zu does not divide %zu devices, using one group\n", __func__, g, n_devs);
+        }
+        g = n_devs;
+    }
+    model->get_split_state_ud.n_devices = g;
+    model->get_split_state_ud.model     = model;
+    std::vector<ggml_backend_dev_t> metas;
+    for (size_t i0 = 0; i0 < n_devs; i0 += g) {
+        LLAMA_LOG_INFO("%s: tensor-parallel group %zu:", __func__, i0/g);
+        for (size_t i = i0; i < i0 + g; ++i) {
+            LLAMA_LOG_CONT(" %s", ggml_backend_dev_name(devs[i]));
+        }
+        LLAMA_LOG_CONT("\n");
+        metas.push_back(ggml_backend_meta_device(devs + i0, g, llama_meta_device_get_split_state, &model->get_split_state_ud));
+    }
+    return metas;
+}
+
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
     // create list of devices to use with this model
@@ -171,12 +199,9 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             for (size_t i = 0; i < n_devs; ++i) {
                 LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(params.devices[i]));
             }
-            model->get_split_state_ud.n_devices = n_devs;
-            model->get_split_state_ud.model = model;
-            model->devices.push_back({
-                true, ggml_backend_meta_device(
-                params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
-            });
+            for (ggml_backend_dev_t meta : llama_tp_group_metas(model, params.devices, n_devs)) {
+                model->devices.push_back({true, meta});
+            }
         } else {
             for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
                 model->devices.push_back({false, *dev});
@@ -193,11 +218,27 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
             std::vector<ggml_backend_dev_t> devs;
             devs.reserve(ggml_backend_dev_count());
+            std::vector<std::string> seen_ids;
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                 auto * dev = ggml_backend_dev_get(i);
                 if (ggml_backend_dev_buffer_type(dev) == ggml_backend_cpu_buffer_type()) {
                     LLAMA_LOG_INFO("%s: skipping %s (%s) for tensor parallelism\n", __func__, ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
                     continue;
+                }
+                // one device per physical GPU (a backend may expose several virtual devices on one GPU)
+                ggml_backend_dev_props props;
+                ggml_backend_dev_get_props(dev, &props);
+                if (props.device_id) {
+                    std::string id = props.device_id;
+                    const size_t v = id.rfind("-v"); // virtual devices: "<pci bus id>-v<index>"
+                    if (v != std::string::npos) {
+                        id.resize(v);
+                    }
+                    if (std::find(seen_ids.begin(), seen_ids.end(), id) != seen_ids.end()) {
+                        LLAMA_LOG_INFO("%s: skipping %s for tensor parallelism: same GPU as an earlier device\n", __func__, ggml_backend_dev_name(dev));
+                        continue;
+                    }
+                    seen_ids.push_back(id);
                 }
                 devs.push_back(dev);
             }
@@ -212,12 +253,9 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             }
 
             GGML_ASSERT(!devs.empty());
-            model->get_split_state_ud.n_devices = devs.size();
-            model->get_split_state_ud.model     = model;
-            gpus.push_back({
-                true, ggml_backend_meta_device(
-                devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)
-            });
+            for (ggml_backend_dev_t meta : llama_tp_group_metas(model, devs.data(), devs.size())) {
+                gpus.push_back({true, meta});
+            }
         } else {
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);

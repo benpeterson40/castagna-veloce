@@ -684,6 +684,19 @@ ggml_tensor * clip_graph::build_ffn(
                 cur = ggml_sqr(ctx0, cur);
                 cb(cur, "ffn_relu_sqr", il);
             } break;
+        case FFN_SILU_CLAMP:
+            {
+                // not ggml_swiglu_oai: it clamps the same way but adds one to the up branch
+                GGML_ASSERT(gate && "FFN_SILU_CLAMP is a gated activation");
+                const float limit = hparams.swiglu_limit;
+                GGML_ASSERT(limit > 0.0f);
+                tmp = ggml_clamp(ctx0, tmp, -limit, limit);
+                cb(tmp, "ffn_up_clamped", il);
+                cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
+                cb(cur, "ffn_gate_clamped", il);
+                cur = ggml_swiglu_split(ctx0, cur, tmp);
+                cb(cur, "ffn_swiglu_limited", il);
+            } break;
     }
 
     if (down) {
@@ -927,6 +940,23 @@ ggml_tensor * clip_graph::build_patch_merge_permute(ggml_tensor * cur, int scale
     return cur;
 }
 
+// encoder matmuls: F32 accumulation, src1 may be rounded to F16 (what the CPU backend does). GPUs that accumulate F16
+// GEMMs in F16 (GCN, pre-Volta NVIDIA) otherwise lose a few % over the long rows of the encoder layers.
+// MTMD_MM_ACC_F16=1 keeps the backend default.
+static void clip_graph_set_mm_prec(ggml_cgraph * gf) {
+    static const bool keep_default = [] { const char * e = getenv("MTMD_MM_ACC_F16"); return e && atoi(e) != 0; }();
+    if (keep_default) {
+        return;
+    }
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if (t->op == GGML_OP_MUL_MAT) {
+            ggml_prec_set_acc(t, GGML_PREC_F32);
+            ggml_prec_set_src(t, GGML_PREC_F16, 1);
+        }
+    }
+}
+
 static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const clip_image_f32_batch & imgs,
                                                             const clip_encode_params * params = nullptr) {
     const clip_image_f32 & img = imgs.entries[0];
@@ -1038,6 +1068,7 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
                 builder = std::make_unique<clip_graph_kimik25>(ctx, img);
             } break;
         case PROJECTOR_TYPE_DEEPSEEK4V:
+        case PROJECTOR_TYPE_DEEPSEEK41V:
             {
                 builder = std::make_unique<clip_graph_deepseek4v>(ctx, img);
             } break;
@@ -1084,6 +1115,10 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
         case PROJECTOR_TYPE_GLM4V:
             {
                 builder = std::make_unique<clip_graph_glm4v>(ctx, img);
+            } break;
+        case PROJECTOR_TYPE_GLM5NEXT:
+            {
+                builder = std::make_unique<clip_graph_glm5next>(ctx, img);
             } break;
         case PROJECTOR_TYPE_QWEN3A:
             {
@@ -1614,6 +1649,31 @@ struct clip_model_loader {
                         const int warmup_side = (int) std::sqrt((double) std::min(256, hparams.dsv4_max_n_token));
                         hparams.set_warmup_n_tokens(warmup_side * warmup_side);
                     } break;
+                case PROJECTOR_TYPE_DEEPSEEK41V:
+                    {
+                        // V4.1: the token budget and the aspect limit come from the GGUF
+                        hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
+                        hparams.image_pad_color   = {127, 127, 127};
+                        hparams.rope_theta = 10000.0f;
+                        get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge);
+                        get_u32(KEY_IMAGE_MIN_PIXELS,   hparams.image_min_pixels);
+                        get_u32(KEY_IMAGE_MAX_TOKENS,   hparams.dsv4_max_n_token);
+                        get_u32(KEY_IMAGE_MAX_WH_RATIO, hparams.dsv4_max_wh_ratio);
+                        if (hparams.dsv4_max_n_token <= 2) {
+                            throw std::runtime_error("deepseek41v image_max_tokens must be greater than 2");
+                        }
+                        const int patch_area = hparams.patch_size * hparams.patch_size * hparams.n_merge * hparams.n_merge;
+                        if (hparams.custom_image_min_tokens > 0) {
+                            hparams.image_min_pixels = hparams.custom_image_min_tokens * patch_area;
+                        }
+                        if (hparams.custom_image_max_tokens > 0) {
+                            hparams.dsv4_max_n_token = std::max(hparams.custom_image_max_tokens, 16);
+                        }
+                        hparams.image_max_pixels = hparams.dsv4_max_n_token * patch_area;
+                        hparams.image_min_pixels = std::min(hparams.image_min_pixels, hparams.image_max_pixels);
+                        const int warmup_side = (int) std::sqrt((double) std::min(256, hparams.dsv4_max_n_token));
+                        hparams.set_warmup_n_tokens(warmup_side * warmup_side);
+                    } break;
                 case PROJECTOR_TYPE_GEMMA3:
                     {
                         // default value (used by all model sizes in gemma 3 family)
@@ -1752,6 +1812,20 @@ struct clip_model_loader {
                         hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
                         hparams.set_limit_image_tokens(8, 4096);
+                        hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
+                    } break;
+                case PROJECTOR_TYPE_GLM5NEXT:
+                    {
+                        hparams.rope_theta = 10000.0f;
+                        hparams.n_merge = 2;
+                        // the reference asks for PILImageResampling.BICUBIC, which this only approximates
+                        hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
+                        get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
+                        get_f32(KEY_VISION_SWIGLU_LIMIT, hparams.swiglu_limit);
+                        hparams.ffn_op = FFN_SILU_CLAMP;
+                        log_ffn_op = "silu_clamp";
+                        // the preprocessor's min_pixels/max_pixels, in tokens
+                        hparams.set_limit_image_tokens(16, 8000);
                         hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
                     } break;
                 case PROJECTOR_TYPE_LLAMA4:
@@ -2571,6 +2645,7 @@ struct clip_model_loader {
                     }
                 } break;
             case PROJECTOR_TYPE_GLM4V:
+            case PROJECTOR_TYPE_GLM5NEXT:
                 {
                     model.mm_fc_w        = get_tensor(string_format(TN_MM_PROJECTOR, "weight"));
                     model.mm_ffn_up_w    = get_tensor(string_format(TN_MM_UP,        "weight"));
@@ -2743,6 +2818,7 @@ struct clip_model_loader {
                     model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
                 } break;
             case PROJECTOR_TYPE_DEEPSEEK4V:
+            case PROJECTOR_TYPE_DEEPSEEK41V:
                 {
                     model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 1, "weight"));
                     model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 1, "bias"));
@@ -2752,7 +2828,9 @@ struct clip_model_loader {
                     model.image_newline        = get_tensor(TN_IMAGE_NEWLINE);
                     model.token_embd_img_start = get_tensor(TN_TOK_IMG_START);
                     model.token_embd_img_end   = get_tensor(TN_TOK_IMG_END);
-                    model.token_embd_img_pad   = get_tensor(TN_TOK_IMG_PAD);
+                    if (model.proj_type == PROJECTOR_TYPE_DEEPSEEK4V) {
+                        model.token_embd_img_pad = get_tensor(TN_TOK_IMG_PAD); // V4.1 has no PAD sentinel
+                    }
                 } break;
             case PROJECTOR_TYPE_PIXTRAL:
                 {
@@ -3762,6 +3840,7 @@ struct clip_model_loader {
     // only initialize backend buffers, but do not allocate them yet
     static support_info_graph reserve_compute_meta(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
         ggml_cgraph * gf = clip_get_graph_builder(&ctx_clip, batch)->build();
+        clip_graph_set_mm_prec(gf);
         ggml_backend_sched_reserve(ctx_clip.sched.get(), gf);
 
         ctx_clip.mem_compute.clear();
@@ -4041,6 +4120,7 @@ int clip_n_output_tokens_x(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_EXAONE4_5:
         case PROJECTOR_TYPE_MIMOVL:
         case PROJECTOR_TYPE_GLM4V:
+        case PROJECTOR_TYPE_GLM5NEXT:
         case PROJECTOR_TYPE_PADDLEOCR:
         case PROJECTOR_TYPE_HUNYUANVL:
         case PROJECTOR_TYPE_YOUTUVL:
@@ -4067,6 +4147,7 @@ int clip_n_output_tokens_y(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_EXAONE4_5:
         case PROJECTOR_TYPE_MIMOVL:
         case PROJECTOR_TYPE_GLM4V:
+        case PROJECTOR_TYPE_GLM5NEXT:
         case PROJECTOR_TYPE_PADDLEOCR:
         case PROJECTOR_TYPE_HUNYUANVL:
         case PROJECTOR_TYPE_YOUTUVL:
@@ -4148,6 +4229,7 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_MIMOVL:
         case PROJECTOR_TYPE_MINIMAX_M3:
         case PROJECTOR_TYPE_GLM4V:
+        case PROJECTOR_TYPE_GLM5NEXT:
         case PROJECTOR_TYPE_YOUTUVL:
         case PROJECTOR_TYPE_MUSE_GLIMMER:
             {
@@ -4196,6 +4278,13 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
                 const int n_llm_w = CLIP_ALIGN(img->nx(), out_patch_size) / out_patch_size;
                 const int n_llm_h = CLIP_ALIGN(img->ny(), out_patch_size) / out_patch_size;
                 n_patches = dsv4_get_block_layout(n_llm_w, n_llm_h, img->lead_pad).n_out;
+            } break;
+        case PROJECTOR_TYPE_DEEPSEEK41V:
+            {
+                const int out_patch_size = params.patch_size * params.n_merge;
+                const int n_llm_w = CLIP_ALIGN(img->nx(), out_patch_size) / out_patch_size;
+                const int n_llm_h = CLIP_ALIGN(img->ny(), out_patch_size) / out_patch_size;
+                n_patches = dsv41_n_output_tokens(n_llm_w, n_llm_h);
             } break;
         case PROJECTOR_TYPE_PADDLEOCR:
         case PROJECTOR_TYPE_DOTS_OCR:
@@ -4436,6 +4525,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     // build the inference graph
     ggml_backend_sched_reset(ctx->sched.get());
     ggml_cgraph * gf = clip_get_graph_builder(ctx, imgs, params)->build();
+    clip_graph_set_mm_prec(gf);
     if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
         LOG_ERR("%s: failed to allocate compute graph\n", __func__);
         return false;
@@ -4783,6 +4873,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN3VL:
         case PROJECTOR_TYPE_GLM4V:
+        case PROJECTOR_TYPE_GLM5NEXT:
             {
                 const int merge_ratio = hparams.n_merge;
                 const int pw = image_size_width  / patch_size;
@@ -5072,6 +5163,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 set_input_i32("pos_w", pos_data);
             } break;
         case PROJECTOR_TYPE_DEEPSEEK4V:
+        case PROJECTOR_TYPE_DEEPSEEK41V:
             {
                 // set the 2D positions (mrope layout, only the first 2 channels are used)
                 int n_patches_per_row = image_size_width / patch_size;
@@ -5087,6 +5179,13 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 const int n_merge = hparams.n_merge;
                 const int n_llm_w = CLIP_ALIGN(pos_w, n_merge) / n_merge;
                 const int n_llm_h = CLIP_ALIGN(pos_h, n_merge) / n_merge;
+
+                if (ctx->model.proj_type == PROJECTOR_TYPE_DEEPSEEK41V) {
+                    auto idx = dsv41_build_layout_indices(n_llm_w, n_llm_h);
+                    set_input_i32("layout_idx", idx);
+                    break;
+                }
+
                 const int n_grid  = n_llm_w * n_llm_h;
                 const int idx_start   = n_grid;
                 const int idx_end     = n_grid + 1;
@@ -5982,6 +6081,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_KIMIK25:
         case PROJECTOR_TYPE_YASA2:
         case PROJECTOR_TYPE_DEEPSEEK4V:
+        case PROJECTOR_TYPE_DEEPSEEK41V:
             return ctx->model.mm_2_w->ne[1];
         case PROJECTOR_TYPE_HUNYUANVL:
             return ctx->model.mm_model_proj->ne[1];
@@ -5997,6 +6097,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_GRANITE4_VISION:
             return ctx->model.qf_proj_blocks.size() * ctx->model.hparams.projection_dim;
         case PROJECTOR_TYPE_GLM4V:
+        case PROJECTOR_TYPE_GLM5NEXT:
             return ctx->model.mm_ffn_down_w->ne[1];
         case PROJECTOR_TYPE_MIMO_AUDIO:
             return ctx->model.mm_2_w->ne[1];

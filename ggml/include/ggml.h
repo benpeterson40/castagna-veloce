@@ -585,6 +585,10 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSV4_HC_MIX,
+        GGML_OP_DSV4_SPARSE_ATTN,
+        GGML_OP_DSV4_COMP_POOL,
+        GGML_OP_GET_ROWS_MEAN,
 
         GGML_OP_UNARY,
 
@@ -2670,6 +2674,15 @@ extern "C" {
     // broadcast:
     //   ne3 % ne33 == 0
     //
+    // mean of groups of n gathered rows: res[:, j, i11, i12] = 1/n * sum_{i<n} a[:, b[n*j + i, i11, i12], i11, i12]
+    // a: [ne0, ne1, ne2, ne3] F32/F16, b: I32 [n*m, ne2, ne3] -> res F32 [ne0, m, ne2, ne3]
+    // (pools the keys of fixed-size blocks, e.g. a sparse-attention indexer, without materializing the gathered rows)
+    GGML_API struct ggml_tensor * ggml_get_rows_mean(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        int                   n);
+
     GGML_API struct ggml_tensor * ggml_lightning_indexer(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -2725,6 +2738,96 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // hc_mix: the whole HC coefficient chain of a sublayer in one op
+    //   x [n_embd, hc, n_tokens], fn [hc*n_embd, (2 + hc)*hc], scale [3], base [(2 + hc)*hc] -> [(2 + hc)*hc, n_tokens]
+    //   mixes = fn @ rms_norm(flatten(x), eps)
+    //   result[0:hc]    = sigmoid(mixes[0:hc]*scale[0] + base[0:hc]) + hc_eps          (pre)
+    //   result[hc:2*hc] = 2*sigmoid(mixes[hc:2*hc]*scale[1] + base[hc:2*hc])            (post)
+    //   result[2*hc:]   = dsv4_hc_comb(mixes, scale, base, hc_eps, n_iter), [dst + hc*src] (comb)
+    //
+    // DeepSeek V4(.1) sparse decode attention: every query row attends to the visible window cells of kv_raw (mask_raw)
+    // and to its top-k rows of kv_comp that mask_comp leaves visible, with per-head attention sinks; K and V are the same
+    // latent rows. As flash attention on the concatenated cells with the top-k mask, without building either.
+    //   q [D, n_head, n_tokens] f32, kv_raw [D, 1, n_raw] f16, mask_raw [n_raw, >= n_tokens] f16,
+    //   kv_comp [D, 1, n_comp] f16, mask_comp [n_comp, >= n_tokens] f16, top_k [k, n_tokens] i32, sinks [n_head] f32 or NULL
+    //   -> [D, n_head, n_tokens] f32
+    GGML_API struct ggml_tensor * ggml_dsv4_sparse_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * kv_raw,
+            struct ggml_tensor  * mask_raw,
+            struct ggml_tensor  * kv_comp,
+            struct ggml_tensor  * mask_comp,
+            struct ggml_tensor  * top_k,
+            struct ggml_tensor  * sinks,
+            float                 scale);
+
+    // Let a DSV4_SPARSE_ATTN node rotate the query itself: q is passed unrotated, the op applies the NORM rope (as
+    // ggml_rope_ext + ggml_rope_set_offset(n_offs)) to dims [n_offs, n_offs + n_dims) of every head before attention and
+    // the inverse rotation (as ggml_rope_ext_back) to the same dims of the output. pos: [n_tokens] i32.
+    GGML_API void ggml_dsv4_sparse_attn_set_rope(
+            struct ggml_tensor  * sa,
+            struct ggml_tensor  * pos,
+            int                   n_dims,
+            int                   n_offs,
+            int                   n_ctx_orig,
+            float                 freq_base,
+            float                 freq_scale,
+            float                 ext_factor,
+            float                 attn_factor,
+            float                 beta_fast,
+            float                 beta_slow);
+
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * fn,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 eps,
+            float                 hc_eps,
+            int32_t               n_iter);
+
+    // DeepSeek V4(.1) KV compressor pooling from its state: the softmax-gated pooling of each compressed block's
+    // candidate rows, then the RMS norm, without materializing the concatenated, gathered and permuted source rows.
+    // The source rows are base (rows 0..n_base-1) then cur (rows n_base..n_base+n_cur-1); with overlap, row
+    // n_base+n_cur is a zero row (kv 0, score -inf).
+    //   overlap (W = 2*E): candidate c <  ratio of block b is dims [0, E)  of row idx[b*ratio + c],
+    //                      candidate c >= ratio of block b is dims [E, 2E) of row idx[n_blocks*ratio + b*ratio + c - ratio]
+    //   otherwise (W = E): candidate c of block b is row idx[b*ratio + c]
+    //   out[e, 0, b] = rms_norm_e(sum_c softmax_c(score[c, e])*kv[c, e], eps)*norm[e]
+    //   base_kv, base_score [W, n_base] f32, cur_kv, cur_score [W, n_cur] f32, idx [n_idx] i32, norm [E] f32
+    //   -> [E, 1, n_blocks] f32, n_blocks = n_idx/(overlap ? 2*ratio : ratio)
+    // A padding block (ratio > 1, the first two candidates of its current window - with overlap the second half - name
+    // the same row) yields zeros: the DeepSeek V4 KV cache pads steps that complete no block with such blocks and writes
+    // them to a masked slot.
+    GGML_API struct ggml_tensor * ggml_dsv4_comp_pool(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * base_kv,
+            struct ggml_tensor  * cur_kv,
+            struct ggml_tensor  * base_score,
+            struct ggml_tensor  * cur_score,
+            struct ggml_tensor  * idx,
+            struct ggml_tensor  * norm,
+            int                   ratio,
+            bool                  overlap,
+            float                 eps);
+
+    // Let a DSV4_COMP_POOL node apply the NORM rope (as ggml_rope_ext + ggml_rope_set_offset(n_offs)) to dims
+    // [n_offs, n_offs + n_dims) of block b at position pos[b]. pos: [n_blocks] i32.
+    GGML_API void ggml_dsv4_comp_pool_set_rope(
+            struct ggml_tensor  * cp,
+            struct ggml_tensor  * pos,
+            int                   n_dims,
+            int                   n_offs,
+            int                   n_ctx_orig,
+            float                 freq_base,
+            float                 freq_scale,
+            float                 ext_factor,
+            float                 attn_factor,
+            float                 beta_fast,
+            float                 beta_slow);
 
     // custom operators
 

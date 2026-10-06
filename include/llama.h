@@ -923,6 +923,11 @@ extern "C" {
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
+// Host state whose tensor data is captured asynchronously: the tensors are copied on device, in stream order after
+// the work already queued, and dst is completed at the next llama_synchronize() (dst must stay valid until then).
+// Unlike every other get, it does not wait for queued work, so a pipelined prompt keeps flowing across the capture.
+#define LLAMA_STATE_SEQ_FLAGS_ASYNC 4
+
     typedef uint32_t llama_state_seq_flags;
 
     LLAMA_API size_t llama_state_seq_get_size_ext(

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <unordered_set>
 #include <mutex>
 
 #if defined(GGML_USE_HIP)
@@ -1457,6 +1458,65 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    // F32 graph tensors whose producer stored them as F16 in place because every consumer reads F16; reset for every
+    // graph evaluation. ld: F16 row stride in halves (0 = compact, rows of ne[0] halves). See ggml_cuda_xn_consumers_f16_ok.
+    struct f16_inplace_entry { const ggml_tensor * t; int64_t ld; };
+    std::vector<f16_inplace_entry> f16_inplace;
+
+    // inject MUL_MAT whose result the last persistent HC pre kernel accumulated into its device stash (hc-persist.cu);
+    // the next persistent kernel then starts at that node and reads the stash. Reset for every graph evaluation.
+    const ggml_tensor * hcp_inject_node = nullptr;
+    const ggml_tensor * hcp_shexp_node  = nullptr; // likewise the shared expert run (GGML_CUDA_HC_PERSIST=4)
+    std::vector<std::pair<const ggml_tensor *, int>> hcp_done; // (first node, length) computed early by a persistent kernel
+    std::vector<const ggml_tensor *> early_done; // nodes computed early by a fused launch (multi-matrix gemv1)
+    // conv-state GET_ROWS gathers deferred into the GDN conv block kernel (read straight from the cache): (concat, gather);
+    // the gather runs before the concat when the conv block does not fuse. Reset for every graph evaluation.
+    std::vector<std::pair<const ggml_tensor *, const ggml_tensor *>> conv_state_rows;
+    const ggml_tensor * hcp_ar_absorb = nullptr; // deferred AllReduce tensor a persistent kernel of this graph absorbs
+    // -sm tensor: the inject MUL_MAT is in the next graph split, where the producer cannot see it. The consumer records
+    // producer HC-down weight -> inject weight on first sight (xn buffers are reused across layers, weights are unique);
+    // later launches of that producer compute the stash, used when no other persistent kernel ran in between.
+    std::unordered_map<const void *, const void *> hcp_inj_map;
+    const void * hcp_last_down = nullptr; // last persistent launch: its HC-down weight, xn data, launch number
+    const void * hcp_last_xn   = nullptr;
+    const void * hcp_last_injw = nullptr; // inject weight it computed the stash with (nullptr: none)
+    uint64_t     hcp_last_seq  = 0;
+    uint64_t     hcp_seq       = 0;
+
+    // gated-DeltaNet q/k RMS_NORM -> SCALE pairs that were skipped because the GDN kernel normalizes q/k itself;
+    // reset for every graph evaluation
+    struct gdn_qknorm {
+        const ggml_tensor * q_out, * k_out; // the SCALE nodes the GDN reads
+        const ggml_tensor * q_raw, * k_raw; // their un-normalized inputs (views that stay live until the GDN)
+        float eps_q, eps_k, sc_q, sc_k;
+    };
+    std::vector<gdn_qknorm> gdn_qknorms;
+    // GDN nodes that read their state straight from the recurrent cache (their GET_ROWS gather is skipped)
+    struct gdn_state_row { const ggml_tensor * gdn; const float * base; const int32_t * ids; };
+    std::vector<gdn_state_row> gdn_state_rows;
+    // q8_1 copies of matmul activations quantized during this graph evaluation, reused by later matmuls that read the
+    // same tensor (q/k/v, z/qkv, ... share their input); cleared at the start of every evaluation, so the buffers stay
+    // reserved for the whole graph (also while a captured graph replays)
+    struct q8_cache_entry {
+        const ggml_tensor * t;
+        int type;
+        int64_t ne[4];
+        std::unique_ptr<ggml_cuda_pool_alloc<char>> buf;
+    };
+    std::vector<q8_cache_entry> q8_cache;
+    // shared-expert branch run concurrently with the routed experts at decode (see ggml_backend_cuda_graph_optimize):
+    // keyed by the branch's first node; side = its nodes (run on stream 1), join = the first node that needs its result
+    struct shexp_conc { std::unordered_set<const ggml_tensor *> side; const ggml_tensor * join; };
+    std::unordered_map<const ggml_tensor *, shexp_conc> shexp_conc_map;
+    std::vector<cudaEvent_t> conc_events; // fork/done pairs, reused per graph evaluation
+    int64_t q8_cache_hits = 0, q8_cache_misses = 0;
+    // DSV4_HC_MIX per-token arrival counters (zero between launches), allocated on first use
+    int * hc_mix_counters = nullptr;
+    int * hc_step_gen = nullptr; // dsv4_hc_step_f32 grid barrier generations (per token)
+    int * router1_counter = nullptr; // ggml_cuda_router1_topk arrival counter
+    int * moe1_counters = nullptr; // moe1_down3_q3k per-row-block arrival counters
+    int * gemv1_epi_counter = nullptr; // multi-matrix gemv1 epilogue (kv norm/rope/cache row) arrival counter
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
@@ -1714,4 +1774,29 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
 
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
+}
+
+static inline const ggml_tensor * ggml_cuda_view_base(const ggml_tensor * t) {
+    while (t->view_src) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+// F16 row stride (halves) of a tensor stored as F16 in place, 0 if it is not (row length k for compact storage)
+static inline int64_t ggml_cuda_f16_inplace_ld(const ggml_backend_cuda_context & ctx, const ggml_tensor * t, const int64_t k) {
+    if (ctx.f16_inplace.empty()) {
+        return 0;
+    }
+    const ggml_tensor * b = ggml_cuda_view_base(t);
+    for (const auto & e : ctx.f16_inplace) {
+        if (e.t == b) {
+            return e.ld ? e.ld : k;
+        }
+    }
+    return 0;
+}
+
+static inline bool ggml_cuda_is_f16_inplace(const ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
+    return ggml_cuda_f16_inplace_ld(ctx, t, 1) != 0;
 }

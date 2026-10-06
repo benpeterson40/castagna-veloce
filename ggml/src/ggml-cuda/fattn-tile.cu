@@ -1,7 +1,21 @@
 #include "common.cuh"
 #include "fattn-tile.cuh"
 
+thread_local bool ggml_cuda_fattn_tile_swap_yz = false;
+thread_local bool ggml_cuda_fattn_tile_kv_idx = false;
+thread_local bool ggml_cuda_fattn_tile_kv_idx_used = false;
+
+namespace {
+struct fattn_tile_swap_guard {
+#ifdef GGML_USE_HIP
+    fattn_tile_swap_guard()  { ggml_cuda_fattn_tile_swap_yz = true; }  // the HIP tile kernel reads the swapped grid
+    ~fattn_tile_swap_guard() { ggml_cuda_fattn_tile_swap_yz = false; }
+#endif // GGML_USE_HIP
+};
+}
+
 void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const fattn_tile_swap_guard swap_guard;
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     switch (K->ne[0]) {

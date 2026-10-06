@@ -54,6 +54,38 @@ static common_speculative_output_limits server_output_limits(const common_params
 
 // synthetic draft verification for benchmarking - accept draft tokens at random instead of by match with the target
 // on replay the draft was already accepted before a context checkpoint restore, so repeat the same decisions
+// LLAMA_SERVER_TIMING=1: wall-clock split of the generation loop (update_slots) per 200 iterations: draft, the target
+// decode + sync, the verify/accept step, and everything else
+struct server_loop_timing {
+    bool on = [] { const char * e = getenv("LLAMA_SERVER_TIMING"); return e && atoi(e) != 0; }();
+    int period = [] { const char * e = getenv("LLAMA_SERVER_TIMING"); const int v = e ? atoi(e) : 0; return v > 1 ? v : 200; }(); // =N: report every N iterations
+    int64_t t_iter = 0, t_draft = 0, t_dec = 0, t_acc = 0, t_submit = 0, n = 0, t0 = 0;
+    int64_t t_pre = 0, t_mid = 0, t_post = 0, t_mark = 0; // the "other" time: before the draft, draft -> decode, decode -> accept
+    void mark(int64_t & b) { if (on && t_mark) { const int64_t now = ggml_time_us(); b += now - t_mark; t_mark = now; } }
+    void restart() { if (on) { t_mark = ggml_time_us(); } }
+    int64_t t_dec_k[9] = {}, n_dec_k[9] = {}; // target decode + sync by batch size
+    int64_t t_inner_k[9] = {}, t_lat_k[9] = {}; // inside the yield: decode+sync; and yield start -> work start
+    void begin() { if (on) { t0 = ggml_time_us(); t_mark = t0; } }
+    void end() {
+        if (!on || t0 == 0) { return; }
+        t_iter += ggml_time_us() - t0; t0 = 0;
+        if (++n % period == 0) {
+            fprintf(stderr, "server loop timing: per iteration %.2f ms = draft %.2f + target decode+sync %.2f (host submit %.2f) + verify/accept %.2f + other %.2f\n",
+                t_iter/1e3/n, t_draft/1e3/n, t_dec/1e3/n, t_submit/1e3/n, t_acc/1e3/n, (t_iter - t_draft - t_dec - t_acc)/1e3/n);
+            fprintf(stderr, "server loop timing:   other: before the draft %.2f, draft -> decode %.2f, decode -> accept %.2f ms\n",
+                t_pre/1e3/n, t_mid/1e3/n, t_post/1e3/n);
+            t_pre = t_mid = t_post = 0;
+            for (int k = 1; k <= 8; ++k) {
+                if (n_dec_k[k]) { fprintf(stderr, "server loop timing:   target decode+sync of %d tokens: %.2f ms (x%lld); inside the yield %.2f ms (work started after %.3f ms)\n",
+                        k, t_dec_k[k]/1e3/n_dec_k[k], (long long) n_dec_k[k], t_inner_k[k]/1e3/n_dec_k[k], t_lat_k[k]/1e3/n_dec_k[k]); }
+                t_dec_k[k] = n_dec_k[k] = t_inner_k[k] = t_lat_k[k] = 0;
+            }
+            t_iter = t_draft = t_dec = t_acc = t_submit = n = 0;
+        }
+    }
+};
+static server_loop_timing g_srv_t;
+
 static std::vector<llama_token> server_sample_and_accept_synth(
         common_sampler * smpl,
         llama_context * ctx,
@@ -301,6 +333,9 @@ struct server_slot {
             return false;
         }
 
+        // complete asynchronously captured checkpoints before the prompt (and its checkpoints) is copied
+        llama_synchronize(ctx_tgt);
+
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
@@ -333,6 +368,8 @@ struct server_slot {
 
     void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
+
+        llama_synchronize(ctx_tgt); // pending async checkpoint captures write into prompt.checkpoints
 
         mem.seq_rm(id, -1, -1);
 
@@ -492,7 +529,12 @@ struct server_slot {
         //       also, need to leave space for 1 extra token to allow context shifts
         int n_draft_max = n_ctx - prompt.n_tokens() - 2;
 
-        if (n_remaining() > 0) {
+        // LLAMA_SERVER_DRAFT_TO_LIMIT=1: also cap the draft at the tokens left before n_predict. Off by default: the cap
+        // shortens the last drafts of a length-limited answer, which gives the target new (rebuilt, ~80 ms each on
+        // DeepSeek V4 TP4) verify shapes, and one such short DSpark verify faulted (illegal memory access, a JavaScript
+        // prompt at max_tokens 200, 2026-10-04). Tokens accepted past the limit are dropped by process_token.
+        static const bool draft_to_limit = [] { const char * e = getenv("LLAMA_SERVER_DRAFT_TO_LIMIT"); return e && atoi(e) != 0; }();
+        if (draft_to_limit && n_remaining() > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
         }
 
@@ -544,6 +586,8 @@ struct server_slot {
     void release() {
         if (is_processing()) {
             GGML_ASSERT(task);
+
+            llama_synchronize(ctx_tgt); // a cancelled prompt may still have async checkpoint captures in flight
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
@@ -1269,6 +1313,7 @@ private:
 
         if (ctx_dft) {
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+            common_speculative_set_dft_full_ckpt(spec.get(), ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
         }
 
         if (spec) {
@@ -2309,6 +2354,20 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // only checkpoints of the current task can still be receiving async captures: complete them before one of
+        // those is erased below (superseded at the same position, or evicted from a full list)
+        {
+            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+            const auto & cps = slot.prompt.checkpoints;
+            bool at_risk = !cps.empty() && cps.size() + 1 >= (size_t) params_base.n_ctx_checkpoints && cps.front().id_task == id_task;
+            for (const auto & c : cps) {
+                at_risk = at_risk || (c.id_task == id_task && c.n_tokens == n_tokens_new);
+            }
+            if (at_risk) {
+                llama_synchronize(ctx_tgt);
+            }
+        }
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -2360,7 +2419,10 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        // async capture: the prompt keeps flowing through the pipeline instead of draining for the state read
+        // (LLAMA_CKPT_SYNC=1 restores the blocking read)
+        static const bool ckpt_sync = [] { const char * e = getenv("LLAMA_CKPT_SYNC"); return e && atoi(e) != 0; }();
+        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | (ckpt_sync ? 0 : LLAMA_STATE_SEQ_FLAGS_ASYNC));
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
@@ -2791,6 +2853,8 @@ private:
 #endif
 
     void update_slots() {
+        g_srv_t.begin();
+        struct srv_t_end { ~srv_t_end() { g_srv_t.end(); } } srv_t_end_guard;
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -2980,6 +3044,16 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // LLAMA_SPEC_MAX_SLOTS=N (default 0 = no limit): no new drafts while more than N slots are generating. With
+        // several users the verify batches (n_slots x (1 + drafts) tokens) leave the small-batch decode kernels and
+        // drafting costs more than it saves (GLM-5.3 Q4, 8 MI50s, MTP 3: C4 57.5 t/s total vs 104.9 without MTP)
+        static const int spec_max_slots = [] { const char * e = getenv("LLAMA_SPEC_MAX_SLOTS"); return e ? atoi(e) : 0; }();
+        int n_gen_slots = 0;
+        iterate(slots, [&](server_slot & slot) {
+            n_gen_slots += slot.state == SLOT_STATE_GENERATING;
+        });
+        const bool spec_skip = spec_max_slots > 0 && n_gen_slots > spec_max_slots;
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
@@ -3001,7 +3075,8 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                // a slot with a partial draft to reuse keeps it; only new drafts are skipped
+                const int n_draft_max = spec_skip && slot.spec_draft.empty() ? 0 : slot.get_n_draft_max();
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -3042,9 +3117,13 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            g_srv_t.mark(g_srv_t.t_pre);
+            const int64_t tdr = ggml_time_us();
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            g_srv_t.t_draft += ggml_time_us() - tdr;
+            g_srv_t.restart();
         }
 
         // make checkpoints if needed
@@ -3387,6 +3466,7 @@ private:
 
                             {
                                 // erase any checkpoints with pos_max > pos_next
+                                llama_synchronize(ctx_tgt); // (complete any async checkpoint capture first)
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next) {
@@ -3520,6 +3600,24 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // pipeline-friendly first checkpoint: break where the batch holds whole ubatches, between 4 + n_ubatch
+                    // and 4 + 2*n_ubatch - 1 tokens before the end, so the partial ubatch comes last instead of a full one
+                    // that would have to drain through every pipeline stage (LLAMA_CKPT_NO_ALIGN=1: exactly 4 + n_ubatch)
+                    static const bool ckpt_no_align = [] { const char * e = getenv("LLAMA_CKPT_NO_ALIGN"); return e && atoi(e) != 0; }();
+                    const int batch_size_start = batch.size();
+                    const int rem_start = slot.task->n_tokens() - slot.prompt.n_tokens();
+                    const bool ckpt_align = !ckpt_no_align && rem_start >= 4 + 2*n_ubatch && n_batch >= 4 + 2*n_ubatch;
+                    // a batch starting inside the window already gets its checkpoint at its start (created before decode)
+                    const bool ckpt_in_window = !ckpt_no_align && rem_start > 4 + n_ubatch && rem_start < 4 + 2*n_ubatch;
+
+                    // LLAMA_CKPT_LAST_VERIFY=1: the last prompt chunk (split off so that a checkpoint lands just before the
+                    // prompt end, normally 4 tokens) takes the shape of the first decode batch (with speculative decoding the
+                    // verify: a typical draft + 1 tokens, all outputs; else 1 token), so that batch reuses the chunk's graph instead of
+                    // building, allocating and running uncaptured one more graph per request
+                    static const bool ckpt_last_verify = [] { const char * e = getenv("LLAMA_CKPT_LAST_VERIFY"); return e && atoi(e) != 0; }();
+                    const int n_last_chunk = !ckpt_last_verify ? 4 :
+                        slot.can_speculate() ? common_speculative_n_typical(slot.spec) + 1 : 1;
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
@@ -3562,10 +3660,21 @@ private:
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            const int checkpoint_offsets[] = {4 + n_ubatch, n_last_chunk};
 
                             bool should_break = false;
+                            if (ckpt_align) {
+                                const int remaining = slot.task->n_tokens() - slot.prompt.n_tokens();
+                                const int in_batch  = batch.size() - batch_size_start;
+                                if (remaining >= 4 + n_ubatch && remaining < 4 + 2*n_ubatch && in_batch >= n_ubatch &&
+                                        in_batch % n_ubatch == 0) {
+                                    break;
+                                }
+                            }
                             for (int offset : checkpoint_offsets) {
+                                if ((ckpt_align || ckpt_in_window) && offset == 4 + n_ubatch) {
+                                    continue; // replaced by the aligned break above
+                                }
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
@@ -3596,6 +3705,11 @@ private:
 
                         // extract the logits only for the last token
                         batch.set_output(batch.size() - 1, true);
+                        if (ckpt_last_verify && n_last_chunk > 1 && n_tokens_cur == n_last_chunk) {
+                            for (int i = batch.size() - n_tokens_cur; i < batch.size(); ++i) {
+                                batch.set_output(i, true);
+                            }
+                        }
 
                         slot.stats.n_gen = 0;
                         slot.i_batch     = batch.size() - 1;
@@ -3678,12 +3792,24 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        g_srv_t.mark(g_srv_t.t_mid);
+        const int64_t tdc = ggml_time_us();
+        int64_t tw_beg = 0, tw_end = 0;
         queue_tasks.yield_to_queue([&]() {
+            tw_beg = ggml_time_us();
             ret = llama_decode(ctx_tgt, batch_view);
+            g_srv_t.t_submit += ggml_time_us() - tdc;
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            tw_end = ggml_time_us();
         });
+        g_srv_t.t_dec += ggml_time_us() - tdc;
+        g_srv_t.restart();
+        if (batch_view.n_tokens >= 1 && batch_view.n_tokens <= 8) {
+            g_srv_t.t_dec_k[batch_view.n_tokens] += ggml_time_us() - tdc; g_srv_t.n_dec_k[batch_view.n_tokens]++;
+            g_srv_t.t_inner_k[batch_view.n_tokens] += tw_end - tw_beg; g_srv_t.t_lat_k[batch_view.n_tokens] += tw_beg - tdc;
+        }
 
         if (ret != 0) {
             {
@@ -3907,6 +4033,9 @@ private:
             GGML_ASSERT(n_draft > 0);
 
             // verify and try to accept the draft
+            g_srv_t.mark(g_srv_t.t_post);
+            const int64_t tac = ggml_time_us();
+            struct srv_t_acc { int64_t t; ~srv_t_acc() { g_srv_t.t_acc += ggml_time_us() - t; } } srv_t_acc_guard{tac};
             {
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 

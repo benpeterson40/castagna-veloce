@@ -52,6 +52,8 @@
 #define KEY_IMAGE_SIZE              "clip.vision.image_size"
 #define KEY_IMAGE_MIN_PIXELS        "clip.vision.image_min_pixels"
 #define KEY_IMAGE_MAX_PIXELS        "clip.vision.image_max_pixels"
+#define KEY_IMAGE_MAX_TOKENS        "clip.vision.image_max_tokens"
+#define KEY_IMAGE_MAX_WH_RATIO      "clip.vision.image_max_wh_ratio"
 #define KEY_PREPROC_MIN_TILES       "clip.vision.preproc_min_tiles"
 #define KEY_PREPROC_MAX_TILES       "clip.vision.preproc_max_tiles"
 #define KEY_PREPROC_IMAGE_SIZE      "clip.vision.preproc_image_size"
@@ -63,6 +65,7 @@
 #define KEY_PROJ_SAMPLE_WINDOW_SIDE "clip.vision.projector.window_side"
 #define KEY_PROJ_SPATIAL_OFFSETS    "clip.vision.projector.spatial_offsets"
 #define KEY_SPATIAL_MERGE_SIZE      "clip.vision.spatial_merge_size"
+#define KEY_VISION_SWIGLU_LIMIT     "clip.vision.swiglu_limit"
 
 #define KEY_MM_PATCH_MERGE_TYPE    "clip.vision.mm_patch_merge_type"
 #define KEY_IMAGE_GRID_PINPOINTS   "clip.vision.image_grid_pinpoints"
@@ -484,8 +487,10 @@ enum projector_type {
     PROJECTOR_TYPE_DEEPSEEKOCR,
     PROJECTOR_TYPE_DEEPSEEKOCR2,
     PROJECTOR_TYPE_DEEPSEEK4V,
+    PROJECTOR_TYPE_DEEPSEEK41V,
     PROJECTOR_TYPE_LFM2A,
     PROJECTOR_TYPE_GLM4V,
+    PROJECTOR_TYPE_GLM5NEXT,
     PROJECTOR_TYPE_YOUTUVL,
     PROJECTOR_TYPE_YASA2,
     PROJECTOR_TYPE_KIMIK25,
@@ -549,8 +554,10 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_DEEPSEEKOCR,       "deepseekocr"},
     { PROJECTOR_TYPE_DEEPSEEKOCR2,      "deepseekocr2"},
     { PROJECTOR_TYPE_DEEPSEEK4V,        "deepseek4v"},
+    { PROJECTOR_TYPE_DEEPSEEK41V,       "deepseek41v"},
     { PROJECTOR_TYPE_LFM2A,             "lfm2a"},
     { PROJECTOR_TYPE_GLM4V,             "glm4v"},
+    { PROJECTOR_TYPE_GLM5NEXT,          "glm5next"},
     { PROJECTOR_TYPE_YOUTUVL,           "youtuvl"},
     { PROJECTOR_TYPE_YASA2,             "yasa2"},
     { PROJECTOR_TYPE_KIMIK25,           "kimik25"},
@@ -793,6 +800,31 @@ static inline dsv4_block_layout dsv4_get_block_layout(int n_llm_w, int n_llm_h, 
     bl.pad_last = (bl.rows / 2 * bl.row_len) % 2 * 2;
     bl.n_out    = lead_pad + 1 + bl.rows * bl.row_len + bl.pad_last + 1;
     return bl;
+}
+
+// deepseek41v: the LLM token block is [START] then each grid row followed by a [NEWLINE], then [END] (no padding, rows in
+// row-major order); indices into the aligner output with the sentinels appended at n_grid + 0 (start), 1 (end), 2 (newline)
+static inline int dsv41_n_output_tokens(int n_llm_w, int n_llm_h) {
+    return 1 + n_llm_h * (n_llm_w + 1) + 1;
+}
+
+static inline std::vector<int32_t> dsv41_build_layout_indices(int n_llm_w, int n_llm_h) {
+    const int n_grid      = n_llm_w * n_llm_h;
+    const int idx_start   = n_grid;
+    const int idx_end     = n_grid + 1;
+    const int idx_newline = n_grid + 2;
+
+    std::vector<int32_t> idx;
+    idx.reserve(dsv41_n_output_tokens(n_llm_w, n_llm_h));
+    idx.push_back(idx_start);
+    for (int row = 0; row < n_llm_h; ++row) {
+        for (int col = 0; col < n_llm_w; ++col) {
+            idx.push_back(row * n_llm_w + col);
+        }
+        idx.push_back(idx_newline);
+    }
+    idx.push_back(idx_end);
+    return idx;
 }
 
 //

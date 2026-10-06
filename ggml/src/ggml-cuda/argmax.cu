@@ -8,8 +8,10 @@
 static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __restrict__ dst, const int64_t ncols) {
     const int64_t row = blockIdx.x;
 
+    // index 0 when no value beats -FLT_MAX (a row of -inf or NaN), as ggml_vec_argmax_f32 on the CPU: -1 made the
+    // GET_ROWS that consumes it read out of bounds (DeepSeek V4 DSpark Markov head, illegal memory access, 2026-10-04)
     float maxval = -FLT_MAX;
-    int   argmax = -1;
+    int   argmax = 0;
     const float * rowx = x + row * ncols;
 
     for (int32_t col = threadIdx.x; col < ncols; col += blockDim.x) {

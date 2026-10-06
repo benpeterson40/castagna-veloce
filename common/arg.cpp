@@ -2824,6 +2824,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SPLIT_MODE"));
     add_opt(common_arg(
+        {"-tpg", "--tp-group"}, "N",
+        "with --split-mode tensor: GPUs per tensor-parallel group; the layers are pipelined across the groups\n"
+        "(e.g. 4 GPUs with 2 = two pairs; 0 = one group over all GPUs; default: 2 with 4 or more GPUs)",
+        [](common_params & params, int value) {
+            GGML_UNUSED(params);
+            setenv("LLAMA_TP_GROUP", std::to_string(value).c_str(), 1);
+        }
+    ));
+    add_opt(common_arg(
         {"-ts", "--tensor-split"}, "N0,N1,N2,...",
         "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1",
         [](common_params & params, const std::string & value) {

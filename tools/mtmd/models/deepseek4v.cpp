@@ -1,6 +1,6 @@
 #include "models.h"
 
-// DeepSeek-V4-Flash-Vision encoder (deepseek4v)
+// DeepSeek-V4-Flash-Vision encoder (deepseek4v, and deepseek41v for DeepSeek-V4.1-Flash)
 //
 // native-resolution ViT (RMSNorm, SwiGLU, 2D RoPE, no CLS / learned pos-embd)
 // then the "aligner": 3x3 patch merge (torch.nn.functional.unfold) + 2-layer GELU MLP
@@ -13,10 +13,13 @@
 // pairs of adjacent rows are interleaved column-wise ("N-layout")
 // the mapping is precomputed on CPU as the "layout_idx" input (see set_input in clip.cpp)
 //
+// deepseek41v (V4.1) uses 3 sentinels (no PAD) and row-major rows each followed by a NEWLINE, no padding.
+//
 // ref: inference/vision.py and inference/image_processor.py in the HF repo
 
 ggml_cgraph * clip_graph_deepseek4v::build() {
     const int n_merge = hparams.n_merge;
+    const bool is_v41 = proj_type == PROJECTOR_TYPE_DEEPSEEK41V;
 
     // 2D input positions
     ggml_tensor * positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches * 4);
@@ -72,20 +75,24 @@ ggml_cgraph * clip_graph_deepseek4v::build() {
         const int64_t n_embd_out = cur->ne[0];
         const int64_t n_grid     = cur->ne[1]; // n_llm_w * n_llm_h
 
-        // rows n_grid + 0..3, keep in sync with the index computation in set_input
+        // rows n_grid + 0..3 (V4.1: 0..2, no PAD), keep in sync with the index computation in set_input
         ggml_tensor * sentinels[] = {
             model.token_embd_img_start,
             model.token_embd_img_end,
             model.image_newline,
-            model.token_embd_img_pad,
         };
         for (ggml_tensor * tok : sentinels) {
             cur = ggml_concat(ctx0, cur, ggml_reshape_2d(ctx0, tok, n_embd_out, 1), 1);
         }
+        if (!is_v41) {
+            cur = ggml_concat(ctx0, cur, ggml_reshape_2d(ctx0, model.token_embd_img_pad, n_embd_out, 1), 1);
+        }
 
         const int n_llm_w = CLIP_ALIGN(n_patches_x, n_merge) / n_merge;
         const int n_llm_h = CLIP_ALIGN(n_patches_y, n_merge) / n_merge;
-        const int n_out   = dsv4_get_block_layout(n_llm_w, n_llm_h, img.lead_pad).n_out;
+        const int n_out   = is_v41
+            ? dsv41_n_output_tokens(n_llm_w, n_llm_h)
+            : dsv4_get_block_layout(n_llm_w, n_llm_h, img.lead_pad).n_out;
         GGML_ASSERT(n_grid == n_llm_w * n_llm_h);
 
         ggml_tensor * layout_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_out);

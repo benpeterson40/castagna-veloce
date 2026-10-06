@@ -145,6 +145,29 @@ private:
     static void safe_resize(int height, int width, int & best_height, int & best_width, int p, int r, int max_n_token);
 };
 
+// ref: DeepSeek-V4.1-Flash (deepseek41v): same encoder as V4, plain row-major token layout
+struct mtmd_image_preprocessor_deepseek41v : mtmd_image_preprocessor {
+    mtmd_image_preprocessor_deepseek41v(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+
+    struct grid_info {
+        int n_llm_h;
+        int n_llm_w;
+        int best_height;
+        int best_width;
+
+        int n_tokens() const {
+            return dsv41_n_output_tokens(n_llm_w, n_llm_h);
+        }
+    };
+
+    static grid_info plan_image_grid(int width, int height, int p, int r, int max_n_token, int min_pixels, int max_wh_ratio);
+
+private:
+    static grid_info grid_tokens(int best_height, int best_width, int p, int r);
+    static void solve_resize_ratio(int height, int width, int p, int r, int max_n_token, int & best_height, int & best_width);
+};
+
 // custom llava-uhd slicing logic for MiniCPM-V
 struct mtmd_image_preprocessor_minicpmv : mtmd_image_preprocessor_llava_uhd {
     using mtmd_image_preprocessor_llava_uhd::mtmd_image_preprocessor_llava_uhd;
@@ -254,4 +277,20 @@ struct mtmd_image_preprocessor_granite : mtmd_image_preprocessor_llava_uhd {
 struct mtmd_image_preprocessor_muse_glimmer : mtmd_image_preprocessor {
     mtmd_image_preprocessor_muse_glimmer(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+};
+
+// ref: Glm5NextImageProcessor.{smart_resize,resize}. unlike the Qwen-style smart_resize in
+// mtmd_image_preprocessor_dyn_size, an over-budget image is pasted top-left, not centred
+struct mtmd_image_preprocessor_glm5next : mtmd_image_preprocessor {
+    mtmd_image_preprocessor_glm5next(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+
+    struct geometry {
+        clip_image_size canvas;  // aligned, padded output size
+        clip_image_size content; // resized image, placed at the top-left of the canvas
+    };
+
+    // static so tests can reach it without a clip_ctx
+    static clip_image_size smart_resize(const clip_hparams & hparams, const clip_image_size & size);
+    static geometry        get_geometry(const clip_hparams & hparams, const clip_image_size & size);
 };

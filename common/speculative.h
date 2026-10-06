@@ -29,6 +29,9 @@ int32_t common_speculative_n_max(const common_params_speculative * spec);
 // return the max number of draft tokens from the initialized implementations
 int32_t common_speculative_n_max(const common_speculative * spec);
 
+// draft length of a typical step (see common_speculative_impl::n_typical)
+int32_t common_speculative_n_typical(const common_speculative * spec);
+
 // validate and resolve the unconditional synthetic acceptance rates
 std::vector<double> common_speculative_synth_rates_resolve(const common_params_speculative * spec, int32_t n_max);
 
@@ -84,6 +87,10 @@ void common_speculative_draft(common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+
+// the caller restores the draft context from full-state checkpoints around each draft (its memory cannot remove partial
+// sequences): the MTP drafter then decodes every catch-up on its own (no merging into the draft decode)
+void common_speculative_set_dft_full_ckpt(common_speculative * spec, bool full);
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);

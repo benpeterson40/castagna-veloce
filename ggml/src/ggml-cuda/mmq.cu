@@ -1,5 +1,8 @@
 #include "common.cuh"
 #include "mmq.cuh"
+#include "moe-f16.cuh"
+#include "moe-vec.cuh"
+#include "gcn-q8-gemm.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
 
@@ -82,6 +85,51 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
+static __global__ void mmq_split_k_reduce(const float * __restrict__ part, float * __restrict__ dst, const int nsplit,
+        const int64_t nrows, const int64_t ncols, const int64_t s1) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nrows*ncols) {
+        return;
+    }
+    float sum = 0.0f;
+    for (int s = 0; s < nsplit; ++s) {
+        sum += part[s*nrows*ncols + i];
+    }
+    dst[(i / nrows)*s1 + i % nrows] = sum;
+}
+
+static void ggml_cuda_mmq_split_k_reduce(const float * part, float * dst, int nsplit, int64_t nrows, int64_t ncols, int64_t s1,
+        cudaStream_t stream) {
+    const int64_t n = nrows*ncols;
+    mmq_split_k_reduce<<<(n + 255)/256, 256, 0, stream>>>(part, dst, nsplit, nrows, ncols, s1);
+}
+
+// GCN: dense matmuls with few output rows and a long K (e.g. 320 x 10240) give MMQ only a few dozen tiles for 60 CUs
+// and no stream-k; cut K into slices that run side by side. GGML_MMQ_SPLIT_K=0 disables, =N forces N slices.
+static int ggml_cuda_mmq_split_k(const int cc, const ggml_tensor * src0, const ggml_tensor * src1) {
+    static const int env = [] { const char * e = getenv("GGML_MMQ_SPLIT_K"); return e ? atoi(e) : -1; }();
+    const int64_t K = src0->ne[0], M = src0->ne[1], N = src1->ne[1];
+    if (env == 0 || (!GGML_CUDA_CC_IS_GCN(cc) && env < 0) || src0->ne[2] != 1 || src0->ne[3] != 1 ||
+            src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return 1;
+    }
+    if (env < 0 && ggml_cuda_mmq_gcn_small_n(cc, src0->type, false, N) && K % (4*MMQ_ITER_K) == 0 && K/4 >= 1024) {
+        return 4; // with the 32-wide tile chosen in mul_mat_q_switch_J
+    }
+    const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    const int64_t tiles = ((M + 127)/128) * ((N + 63)/64);
+    int best = 1;
+    for (int s = 2; s <= 8; ++s) {
+        if (K % (s*MMQ_ITER_K) != 0 || K/s < 1024) {
+            continue;
+        }
+        if (env > 0 ? s == env : tiles*s <= 2*nsm) {
+            best = s;
+        }
+    }
+    return best;
+}
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -132,9 +180,23 @@ void ggml_cuda_mul_mat_q(
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
+    if (!ids && ggml_cuda_gcn_q8_gemm(ctx, src0, src1, dst)) {
+        return;
+    }
+    if (!ids && ggml_cuda_gcn_kq_gemm(ctx, src0, src1, dst)) {
+        return;
+    }
+    if (!ids && ggml_cuda_dense_f16_supported(cc, src0, src1, dst)) {
+        ggml_cuda_dense_f16(ctx, src0, src1, dst);
+        return;
+    }
+
     if (!ids) {
+        // tiles may read up to J - ne11 columns past the end: the small-N GCN rule uses J = 32 for 9..32 tokens
+        const int J_pad = std::max(ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11),
+            ggml_cuda_mmq_gcn_small_n(cc, src0->type, false, ne11) ? 32 : 0);
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
-            ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+            J_pad * sizeof(block_q8_1_mmq);
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
@@ -165,6 +227,24 @@ void ggml_cuda_mul_mat_q(
                                 ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
         const int64_t s13 = ne12*s12;
 
+        const int nsplit = use_native_fp4 ? 1 : ggml_cuda_mmq_split_k(cc, src0, src1);
+        if (nsplit > 1) {
+            // split-K: the K slices run as channels of one launch into partial buffers, then one reduction
+            const int64_t kslice = ne00 / nsplit;
+            ggml_cuda_pool_alloc<float> part(ctx.pool(), nsplit*ne01*ne11);
+            const int64_t s_ch_x = kslice / ggml_blck_size(src0->type);                                           // blocks
+            const int64_t s_ch_y = ne11 * (kslice / QK8_1_MMQ) * (int64_t) (sizeof(block_q8_1_mmq)/sizeof(int)); // ints
+            const mmq_args args = {
+                src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, part.get(), nullptr,
+                kslice, ne01, ne1, s01, ne11, ne01,
+                nsplit, nsplit, s_ch_x, s_ch_y, ne01*ne11,
+                1, 1, 0, 0, 0,
+                ne1, ne1};
+            ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+            ggml_cuda_mmq_split_k_reduce(part.get(), dst_d, nsplit, ne01, ne11, s1, stream);
+            return;
+        }
+
         const mmq_args args = {
             src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
@@ -173,6 +253,11 @@ void ggml_cuda_mul_mat_q(
             ne03, ne13, s03, s13, s3,
             ne1, ne1};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+        return;
+    }
+
+    if (ggml_cuda_moe_f16_supported(cc, src0, src1, ids, dst)) {
+        ggml_cuda_moe_f16(ctx, src0, src1, ids, dst);
         return;
     }
 
@@ -198,7 +283,7 @@ void ggml_cuda_mul_mat_q(
         const int sis1 = nb12 / nb11;
 
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream, &ctx.pool());
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -246,8 +331,19 @@ void ggml_cuda_mul_mat_q(
 
     // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
     // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
+    // With the MoE tile map (see launch_mul_mat_q) small tiles no longer flood the grid with empty blocks,
+    // so GCN (e.g. gfx906) also sizes tiles by the per-expert average; otherwise ~10 tokens per expert
+    // land in 128-column tiles. GGML_MMQ_MOE_NCOLS_AVG=0/1 forces the choice for A/B testing.
     int64_t ncols_opt = ne12;
-    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+    static const int moe_ncols_avg_env = [] {
+        const char * s = getenv("GGML_MMQ_MOE_NCOLS_AVG");
+        return s ? atoi(s) : -1;
+    }();
+    // GCN (gfx906, 2048 tokens): the average wins for the K=2560 gate/up projections (6.5 vs 8.1 ms) but loses for the
+    // K=640 down projection (15.0 vs 11.9 ms), whose short K favours wider tiles
+    const bool moe_ncols_avg = moe_ncols_avg_env >= 0 ? moe_ncols_avg_env != 0 :
+        (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) || (GGML_CUDA_CC_IS_GCN(cc) && ne00 >= 2048));
+    if (moe_ncols_avg) {
         ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
     }
 

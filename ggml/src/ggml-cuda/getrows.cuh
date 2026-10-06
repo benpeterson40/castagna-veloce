@@ -12,4 +12,10 @@ void get_rows_cuda(
 
 void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+void ggml_cuda_op_get_rows_mean(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// qwen4exp indexer: RELU -> head sum -> block bias -> block-to-cell expand -> + mask in one kernel (bit-identical)
+void ggml_cuda_idx_score_expand(ggml_backend_cuda_context & ctx, const ggml_tensor * score, const ggml_tensor * bias,
+                                const ggml_tensor * cell_blk, const ggml_tensor * mask, ggml_tensor * out);

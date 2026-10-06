@@ -13,6 +13,7 @@
 
 #include <array>
 #include <map>
+#include <thread>
 #include <vector>
 
 struct llama_model;
@@ -88,6 +89,9 @@ struct llama_context {
 
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
+    float * get_embeddings_nextn_back(int32_t back);
+    int32_t nextn_ring_size() const;
+    int64_t nextn_decode_id() const { return nextn_ring_id; }
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
@@ -344,12 +348,20 @@ private:
 
     std::vector<swap_info> output_swaps;
 
+    // token-indexed extractions (layer inputs, unmasked nextn rows) are written in ubatch order: batch index of each row,
+    // applied lazily with the output swaps; empty when the ubatch order is the batch order
+    std::vector<int32_t> tok_perm;
+
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    // private copies of the target tensors a draft borrows (see llama_cparams::shared_output)
+    ggml_context_ptr        shared_copy_ctx;
+    ggml_backend_buffer_ptr shared_copy_buf;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
@@ -373,11 +385,46 @@ private:
 
     llm_graph_result * gf_res_prev_active = nullptr;
 
+    // a second graph slot with its own scheduler (LLAMA_GRAPH_CACHE2): two alternating graph shapes (e.g. the MTP
+    // drafter's catch-up batch and its single-token draft steps) each keep their allocation instead of re-running
+    // ggml_backend_sched_alloc_graph on every switch. Swapped with sched / gf_res_prev on use.
+    ggml_backend_sched_ptr sched_alt;
+    std::array<llm_graph_result_ptr, 2> gf_res_alt;
+    llm_graph_result * gf_res_alt_active = nullptr;
+    bool graph_cache2 = false;
+    bool sched_alt_active = false; // true while `sched` holds the second (unreserved) scheduler
+    void graph_cache2_swap();
+    void graph_cache2_reset();
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
+    // ring of per-decode unmasked nextn buffers (see llama_get_embeddings_nextn_back)
+    ggml_backend_buffer_ptr buf_nextn_ring;
+    int32_t nextn_ring_n   = -1; // -1: not decided yet
+    int32_t nextn_ring_cur = 0;
+    int64_t nextn_ring_id  = 0;
+    float * nextn_ring_region(int32_t idx) const;
+    bool    nextn_ring_active() const;
+
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+
+public:
+    // LLAMA_STATE_SEQ_FLAGS_ASYNC captures: device snapshot buffers (reused across captures) and the pending reads
+    struct state_async_slot {
+        ggml_backend_buffer_ptr pinned; // host staging the tensors are read into, in stream order
+        std::map<ggml_backend_t, ggml_backend_event_t> events;
+        struct read { const uint8_t * src; uint8_t * dst; size_t size; };
+        std::vector<read> reads;
+        std::thread worker;             // waits for the reads, then copies staging -> dst
+        bool busy = false;
+        ~state_async_slot();
+    };
+    std::vector<std::unique_ptr<state_async_slot>> state_async_slots;
+    void state_async_finish();
+    ggml_backend_t state_async_backend(ggml_backend_buffer_type_t buft) const;
+private:
 
     bool has_evaluated_once = false;
 

@@ -831,6 +831,11 @@ struct mtmd_context {
                     // no vocab tokens are added; the start/end/newline markers are learned embeddings emitted by the encoder
                     image_preproc = std::make_unique<mtmd_image_preprocessor_deepseek4v>(ctx_v);
                 } break;
+            case PROJECTOR_TYPE_DEEPSEEK41V:
+                {
+                    // same as V4: the start/end/newline markers are learned embeddings emitted by the encoder
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_deepseek41v>(ctx_v);
+                } break;
             case PROJECTOR_TYPE_DOTS_OCR:
             case PROJECTOR_TYPE_DOTS3NOTE_V:
                 {
@@ -866,6 +871,13 @@ struct mtmd_context {
                     img_beg = "<|begin_of_image|>";
                     img_end = "<|end_of_image|>";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_GLM5NEXT:
+                {
+                    // glm5next spells video with its own token pair, but video is not supported here
+                    img_beg = "<|begin_of_image|>";
+                    img_end = "<|end_of_image|>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_glm5next>(ctx_v);
                 } break;
             case PROJECTOR_TYPE_PADDLEOCR:
                 {
@@ -1116,6 +1128,35 @@ std::vector<std::vector<const mtmd_bitmap *>> mtmd_group_mergeable_bitmaps(std::
     return output;
 }
 
+// deepseek41v: media is separated from neighbouring text by a blank line ("\n\n"),
+// counting newlines the text already has; nothing is added next to a chat role marker
+static int mtmd_dsv41_separator_padding(const std::string & text, bool leading) {
+    int count = 0;
+    while (count < 2 && (size_t) count < text.size()) {
+        const size_t pos = leading ? count : text.size() - count - 1;
+        if (text[pos] != '\n') {
+            break;
+        }
+        ++count;
+    }
+    return 2 - count;
+}
+
+static bool mtmd_dsv41_is_message_boundary(const std::string & text, bool leading) {
+    const std::string bar = "\xef\xbd\x9c"; // U+FF5C, the bar in DeepSeek's chat tokens
+    const char * roles[] = { "User", "Assistant", "System", "latest_reminder" };
+    for (const char * role : roles) {
+        const std::string token = "<" + bar + role + bar + ">";
+        if (leading && text.size() >= token.size() && text.compare(0, token.size(), token) == 0) {
+            return true;
+        }
+        if (!leading && text.size() >= token.size() && text.compare(text.size() - token.size(), token.size(), token) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 struct mtmd_tokenizer {
     const mtmd_context * ctx;
 
@@ -1251,6 +1292,10 @@ struct mtmd_tokenizer {
 
         auto merged_bitmaps = mtmd_group_mergeable_bitmaps(parts, n_merge_frames);
 
+        const bool is_dsv41 = ctx->ctx_v && ctx->proj_type_v() == PROJECTOR_TYPE_DEEPSEEK41V;
+        bool has_content = false;
+        bool previous_was_media = false;
+        std::string previous_text;
         size_t i_bm = 0;
         for (const auto & p : parts) {
             if (p.bitmap != nullptr) {
@@ -1259,13 +1304,31 @@ struct mtmd_tokenizer {
                             __func__, merged_bitmaps.size(), parts.size() - 1);
                     return 1;
                 }
+                if (is_dsv41 && has_content && (previous_was_media || !mtmd_dsv41_is_message_boundary(previous_text, false))) {
+                    const int padding = previous_was_media ? 2 : mtmd_dsv41_separator_padding(previous_text, false);
+                    add_text(std::string(padding, '\n'), false);
+                }
                 auto bmps = merged_bitmaps[i_bm++];
                 int32_t res = add_media(bmps);
                 if (res != 0) {
                     return res;
                 }
+                has_content = true;
+                previous_was_media = true;
             } else {
+                if (is_dsv41 && p.text.empty()) {
+                    continue;
+                }
+                std::string lead;
+                if (is_dsv41 && previous_was_media && !mtmd_dsv41_is_message_boundary(p.text, true)) {
+                    lead.assign(mtmd_dsv41_separator_padding(p.text, true), '\n');
+                    add_text(lead, false);
+                }
                 add_text(p.text, p.parse_special);
+                has_content = true;
+                previous_was_media = false;
+                // the padding just added counts toward the separator before the next media (e.g. a "\n" between two images)
+                previous_text = lead + p.text;
             }
         }
 

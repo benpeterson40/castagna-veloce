@@ -9,6 +9,38 @@
 #include <map>
 
 class llama_memory_hybrid_idx_context;
+class llama_dsv4_comp_state;
+struct dsv41_rope_cfg;
+
+// The compressor state of a DeepSeek-V4 style compressed stream, as the graph sees it.
+struct dsv4_state_tensors {
+    ggml_tensor * kv;
+    ggml_tensor * score;
+};
+
+// Shared by the DeepSeek-V4 and V4.1 graphs, which run the same compressed stream machinery.
+float dsv4_rope_attn_factor(float freq_scale, float ext_factor);
+
+ggml_tensor * dsv4_view_2d(
+        ggml_context * ctx,
+        ggml_tensor  * t,
+        int64_t        ne0,
+        int64_t        ne1,
+        int64_t        i0);
+
+dsv4_state_tensors dsv4_build_state_restore(
+        ggml_context * ctx,
+        const llm_graph_input_dsv4::comp_input & inp,
+        const llama_dsv4_comp_state * state,
+        int32_t il);
+
+dsv4_state_tensors dsv4_build_state_snapshot(
+        ggml_context * ctx,
+        const llm_graph_input_dsv4::comp_input & inp,
+        const llama_dsv4_comp_state * state,
+        ggml_tensor * source_kv,
+        ggml_tensor * source_score,
+        int32_t il);
 
 // ref: https://github.com/ggml-org/llama.cpp/pull/28068
 static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * x, float eps) {
@@ -1196,9 +1228,20 @@ struct llama_model_deepseek4 : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
-    struct graph : public llm_graph_context {
-        graph(const llm_graph_params & params) : llm_graph_context(params) {}
+    // method-only mixin, so glm5next reaches build_delta_net; deepseek4 has no recurrent layers
+    struct graph : public llm_build_delta_net_base {
+        graph(const llm_graph_params & params) : llm_build_delta_net_base(params) {}
         graph(const llama_model & model, const llm_graph_params & params);
+
+        void build_hc_mixes(
+                ggml_tensor *  x,
+                ggml_tensor *  hc_fn,
+                ggml_tensor *  hc_scale,
+                ggml_tensor *  hc_base,
+                ggml_tensor ** pre,
+                ggml_tensor ** post,
+                ggml_tensor ** comb,
+                int il) const;
 
         ggml_tensor * build_hc_pre(
                 ggml_tensor * x,
@@ -1250,9 +1293,11 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * state_read_idxs,
                 ggml_tensor * comp_pos,
                 ggml_tensor * norm,
+                int64_t ratio,
                 int64_t n_embd_head,
                 const char * name,
-                int il) const;
+                int il,
+                ggml_tensor ** pre_rope = nullptr) const;
 
         ggml_tensor * build_overlap_compressed_kv_from_state(
                 ggml_tensor * kv_state,
@@ -1273,6 +1318,19 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * inp_pos,
                 int il) const;
 
+        ggml_tensor * build_comp_pool_fused(
+                ggml_tensor * base_kv,
+                ggml_tensor * cur_kv,
+                ggml_tensor * base_score,
+                ggml_tensor * cur_score,
+                ggml_tensor * state_read_idxs,
+                ggml_tensor * comp_pos,
+                ggml_tensor * norm,
+                int64_t ratio,
+                bool overlap,
+                const char * name,
+                int il) const;
+
         ggml_tensor * build_top_k_mask(
                 ggml_tensor * kq_mask,
                 ggml_tensor * top_k,
@@ -1290,7 +1348,9 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * inp_pos,
                 ggml_tensor * sinks,
                 float kq_scale,
-                int il) const;
+                int il,
+                ggml_tensor * q_unrot = nullptr,
+                bool * rope_fused = nullptr) const;
 
         ggml_tensor * build_hca_attention(
                 llm_graph_input_dsv4 * inp_dsv4,
@@ -1299,7 +1359,14 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * kv,
                 ggml_tensor * sinks,
                 float kq_scale,
-                int il) const;
+                int il,
+                ggml_tensor * q_unrot = nullptr,
+                bool * rope_fused = nullptr,
+                ggml_tensor * inp_pos = nullptr) const;
+
+        // every compressed row of the HCA cache as an i32 index list (the sparse decode op's selection), one per graph
+        mutable ggml_tensor * hca_all_rows = nullptr;
+        mutable ggml_tensor * csa_all_rows = nullptr; // CSA layers when every compressed row fits the indexer top-k
 
         ggml_tensor * build_raw_attention(
                 llm_graph_input_dsv4_raw * inp_attn,
@@ -1317,10 +1384,96 @@ struct llama_model_deepseek4 : public llama_model_base {
         ggml_tensor * build_hc_sinkhorn(
                 ggml_tensor * comb,
                 int il) const;
+
+        static ggml_tensor * build_hc_mean(
+                ggml_context * ctx,
+                ggml_tensor  * x);
     };
 
     struct graph_mtp : public graph {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
+// DeepSeek-V4.1. Same machinery as V4, minus the hash layers, the MTP block and the learned
+// hyper-connection head, plus the engram n-gram tables. See src/models/deepseek41.cpp.
+struct llama_model_deepseek41 : public llama_model_deepseek4 {
+    llama_model_deepseek41(const struct llama_model_params & params) : llama_model_deepseek4(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    // engram hash constants, read from the file
+    // these live here rather than in hparams because the token map alone is half a megabyte
+    uint32_t engram_n_layer = 0;
+    uint32_t engram_pad_id  = 0;   // already through the token map, as the reference stores it
+
+    std::vector<uint64_t> engram_multipliers; // [engram_n_layer][engram_max_ngram_size]
+    std::vector<uint64_t> engram_primes;      // [engram_n_layer][engram_max_ngram_size - 1][engram_n_head]
+    std::vector<uint64_t> engram_offsets;     // same layout as engram_primes
+    std::vector<int32_t>  engram_token_map;   // [n_vocab], folds case and accents together
+
+    // The shared stream layer roles live in hparams as dsv41_kv_source and friends, because the
+    // KV cache needs them to alias a reader's storage onto its source's. See load_arch_tensors.
+
+    // position of layer il in the engram constants, or -1 if that layer has no engram
+    int engram_index(int il) const;
+
+    struct graph : public llama_model_deepseek4::graph {
+        graph(const llama_model & model, const llm_graph_params & params);
+
+        // gather the n-gram rows of layer il: [engram_key_length * n_hash_cols, n_tokens]
+        ggml_tensor * build_inp_engram(
+                const llama_model & model,
+                int il);
+
+        ggml_tensor * build_engram(
+                const llama_model & model,
+                ggml_tensor * x,
+                ggml_tensor * emb,
+                int il) const;
+
+        struct dsv41_rope_cfg rope_cfg(int il) const;
+
+        ggml_tensor * build_attention_tail(
+                const llama_model & model,
+                ggml_tensor * out,
+                ggml_tensor * inp_pos,
+                int64_t nt,
+                int il,
+                bool deroped = false) const;
+
+        // which compressed positions this layer's queries attend to
+        ggml_tensor * build_indexer_top_k(
+                const llama_model & model,
+                llm_graph_input_dsv4 * inp_dsv4,
+                const llm_graph_input_dsv4::comp_input & inp_comp,
+                ggml_tensor * qr,
+                ggml_tensor * cur,
+                ggml_tensor * inp_pos,
+                int il) const;
+
+        ggml_tensor * build_attention_v41(
+                const llama_model & model,
+                llm_graph_input_dsv4 * inp_dsv4,
+                ggml_tensor * cur,
+                ggml_tensor * inp_pos,
+                int il) const;
+
+        // a KV source layer's compressor: the layer's compressed KV rows, its index keys and its carried state
+        void build_kv_source_v41(
+                const llama_model & model,
+                llm_graph_input_dsv4 * inp_dsv4,
+                ggml_tensor * cur,
+                int il) const;
+
+        // the first decoder layer of the Causal Encoder-Decoder (n_layer/2); its SWA attention uses the decoder mask
+        int ced_n_enc = -1;
+
+        // the top-k ranking each index source published, for the reuse layers after it
+        mutable std::array<ggml_tensor *, LLAMA_MAX_LAYERS> top_k_of_layer = {};
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
@@ -1348,6 +1501,65 @@ struct llama_model_glm_dsa : public llama_model_base {
     };
 
     struct graph_mtp : public llm_graph_context {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+struct llama_model_glm5next : public llama_model_base {
+    llama_model_glm5next(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    // glm5next's mHC is DeepSeek-V4's block, collapsed by unweighted mean, not a gated head
+    struct graph : public llama_model_deepseek4::graph {
+        graph(const llama_model & model, const llm_graph_params & params);
+
+        // builds nothing: lets graph_mtp reuse the block helpers below without the trunk
+        graph(const llm_graph_params & params) : llama_model_deepseek4::graph(params) {}
+
+        // not const: the delta-net helpers append to the graph through the base
+        ggml_tensor * build_layer_attn(
+                const llama_model & model,
+                llm_graph_input_mem_hybrid_k * inp_mem,
+                llm_graph_input_kpool * inp_kp,
+                bool scoring,
+                ggml_tensor * cur,
+                int il);
+
+        ggml_tensor * build_kda_layer(
+                const llama_layer & layer,
+                llm_graph_input_rs * inp_rs,
+                ggml_tensor * cur,
+                int il);
+
+        // `scoring` false keeps the dense path, the same function below n_select
+        ggml_tensor * build_dsa_layer(
+                const llama_layer & layer,
+                llm_graph_input_attn_k * inp_attn,
+                llm_graph_input_kpool * inp_kp,
+                bool scoring,
+                ggml_tensor * cur,
+                int il) const;
+
+        // always stores the key and gate; when `scoring`, returns the selected CELL indices
+        ggml_tensor * build_indexer(
+                const llama_layer & layer,
+                llm_graph_input_kpool * inp_kp,
+                ggml_tensor * cur,
+                ggml_tensor * qr,
+                bool scoring,
+                int il) const;
+
+        ggml_tensor * build_layer_ffn(
+                const llama_model & model,
+                ggml_tensor * cur,
+                int il) const;
+    };
+
+    // NextN draft head. reuses the trunk's block helpers, so it stays a `graph`
+    struct graph_mtp : public graph {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
@@ -2383,6 +2595,7 @@ struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
     class llm_graph_input_qsa;
+    class llm_graph_input_qsa_k;
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
@@ -2431,6 +2644,7 @@ struct llama_model_qwen4exp : public llama_model_base {
         // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
+        std::map<uint32_t, llm_graph_input_qsa_k *> qsa_k_inps;
 
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
         ggml_tensor * build_qsa_top_k(

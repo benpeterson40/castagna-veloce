@@ -1,5 +1,8 @@
 #include "llama-model-loader.h"
 
+#include <atomic>
+#include <thread>
+
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
@@ -7,6 +10,9 @@
 #include "llama.h"
 
 #include <algorithm>
+#ifdef __linux__
+#include <fcntl.h>
+#endif
 #include <array>
 #include <cinttypes>
 #include <cstdint>
@@ -413,6 +419,7 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint32_t, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<uint32_t, LLAMA_MAX_LAYERS> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<uint32_t>>(enum llm_kv kid, std::vector<uint32_t> & result, bool required);
+    template bool llama_model_loader::get_arr<std::vector<uint64_t>>(enum llm_kv kid, std::vector<uint64_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_NGRAM> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_HEADS>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_HEADS> & result, bool required);
 
@@ -851,6 +858,22 @@ const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(c
     }
 
     return nullptr;
+}
+
+bool llama_model_loader::add_prefix_rows_alias(const std::string & base, const std::string & alias, int64_t n_rows) {
+    const llama_tensor_weight * w = get_weight(base.c_str());
+    if (w == nullptr || n_rows <= 0 || w->tensor->ne[1] <= n_rows || w->tensor->ne[2] != 1 || w->tensor->ne[3] != 1 ||
+            weights_map.find(alias) != weights_map.end()) {
+        return false;
+    }
+    ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    alias_ctxs.emplace_back(ctx);
+    ggml_tensor * t = ggml_new_tensor_2d(ctx, w->tensor->type, w->tensor->ne[0], n_rows);
+    ggml_set_name(t, alias.c_str());
+    weights_map.emplace(alias, llama_tensor_weight(w->idx, w->offs, t));
+    n_tensors++;
+    return true;
 }
 
 const llama_model_loader::llama_tensor_weight & llama_model_loader::require_weight(const char * name) const {
@@ -1431,6 +1454,8 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
                     lazy.for_file(idx));
             mmaps_used.emplace_back(mapping->size(), 0);
+            mmaps_keep.emplace_back();
+            mmaps_hot.emplace_back();
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
                 mlock_mmap->init(mapping->addr());
@@ -1604,6 +1629,31 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
+    // LLAMA_LOAD_THREADS (default 1 = serial): threads for the mmap'd uploads to CUDA/ROCm and tensor-split (Meta)
+    // buffers (cudaStreamPerThread keeps the copies independent). Off by default: on MI50 (ROCm, pageable copies) 4
+    // threads were neutral and 8/16 slower (6.6 -> 7.6 / 10.1 s for Qwen3.8-27B TP2)
+    static const int n_load_threads = [] { const char * e = getenv("LLAMA_LOAD_THREADS"); return e ? std::max(1, atoi(e)) : 1; }();
+    // LLAMA_VERIFY_TENSORS=substr (debug): read back uploaded tensors whose name contains substr, compare with the file
+    auto verify_upload = [](const ggml_tensor * t, const void * data, size_t n) {
+        static const char * verify = getenv("LLAMA_VERIFY_TENSORS");
+        if (!verify || strstr(ggml_get_name(t), verify) == nullptr) {
+            return;
+        }
+        std::vector<uint8_t> back(n);
+        ggml_backend_tensor_get(t, back.data(), 0, n);
+        fprintf(stderr, "verify %s (%zu bytes, %s): %s\n", ggml_get_name(t), n, ggml_backend_buffer_name(t->buffer),
+            memcmp(back.data(), data, n) == 0 ? "OK" : "MISMATCH");
+    };
+    struct upload_job { ggml_tensor * t; const uint8_t * data; size_t n; };
+    std::vector<upload_job> upload_jobs;
+    auto upload_parallel = [&](const ggml_tensor * t) {
+        if (n_load_threads <= 1 || check_tensors || !t->buffer || ggml_backend_buffer_is_host(t->buffer)) {
+            return false;
+        }
+        const char * name = ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer));
+        return strncmp(name, "ROCm", 4) == 0 || strncmp(name, "CUDA", 4) == 0 || strncmp(name, "Meta(", 5) == 0;
+    };
+
     std::vector<ggml_tensor *> tensors;
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         tensors.push_back(cur);
@@ -1654,7 +1704,10 @@ bool llama_model_loader::load_all_data(
             }
 
             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
-            if (buf_mmap && cur->data == nullptr) {
+            if (!(buf_mmap && cur->data == nullptr) && upload_parallel(cur)) {
+                // uploaded after the loop by several threads
+                upload_jobs.push_back({cur, data, n_size});
+            } else if (buf_mmap && cur->data == nullptr) {
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
 
                 // locking a lazy tensor would fault all of it in, which is what lazy avoids
@@ -1666,8 +1719,13 @@ bool llama_model_loader::load_all_data(
                 auto & mmap_used = mmaps_used[weight->idx];
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+                mmaps_keep[weight->idx].push_back({weight->offs, weight->offs + n_size});
+                if (!lazy.has(cur)) {
+                    mmaps_hot[weight->idx].push_back({weight->offs, weight->offs + n_size});
+                }
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
+                verify_upload(cur, data, n_size);
             }
         } else {
             const auto & file = files.at(weight->idx);
@@ -1750,6 +1808,31 @@ bool llama_model_loader::load_all_data(
         size_done += n_size;
     }
 
+    // mmap'd tensors for device buffers: pageable -> device copies are staged by the driver and CPU-bound (one thread
+    // ~3.7 GB/s for Qwen3.8-27B Q4 on 2 MI50s, -sm tensor), so several threads copy at once, biggest tensors first
+    if (!upload_jobs.empty()) {
+        std::stable_sort(upload_jobs.begin(), upload_jobs.end(), [](const upload_job & a, const upload_job & b) {
+            return a.n > b.n;
+        });
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> workers;
+        const int nt = std::min<int>(n_load_threads, (int) upload_jobs.size());
+        for (int i = 0; i < nt; ++i) {
+            workers.emplace_back([&] {
+                for (size_t j; (j = next.fetch_add(1)) < upload_jobs.size(); ) {
+                    ggml_backend_tensor_set(upload_jobs[j].t, upload_jobs[j].data, 0, upload_jobs[j].n);
+                }
+            });
+        }
+        for (auto & w : workers) {
+            w.join();
+        }
+        for (const auto & j : upload_jobs) {
+            verify_upload(j.t, j.data, j.n);
+        }
+        upload_jobs.clear();
+    }
+
     // free temporary resources used for async uploads
     for (auto * event : events) {
         ggml_backend_event_synchronize(event);
@@ -1785,6 +1868,50 @@ bool llama_model_loader::load_all_data(
                     mapping->unmap_fragment(mmap_used.second, mapping->size());
                 }
             }
+        }
+        // Everything the GPUs hold went through the page cache during the upload and, between the CPU tensors of a file,
+        // stays mapped: DeepSeek V4.1 (246 GB of weights next to ~65 GB of CPU engram tables on a 256 GB host) then ran in
+        // direct reclaim (allocation stalls of seconds, prefill 230-720 t/s from run to run). Unmap every range that no CPU
+        // tensor reads and drop it from the page cache. LLAMA_MMAP_DROP_UNUSED=0 off.
+        static const bool drop_unused = [] { const char * e = getenv("LLAMA_MMAP_DROP_UNUSED"); return !e || atoi(e) != 0; }();
+        if (drop_unused && use_mmap) {
+            size_t dropped = 0;
+            for (uint32_t idx = 0; idx < mappings.size(); idx++) {
+                auto & mapping = mappings.at(idx);
+                auto keep = mmaps_keep.at(idx);
+                std::sort(keep.begin(), keep.end());
+                size_t pos = 0;
+                auto drop = [&](size_t a, size_t b) {
+                    if (b <= a) {
+                        return;
+                    }
+                    mapping->unmap_fragment(a, b);
+#ifdef __linux__
+                    (void) posix_fadvise(files.at(idx)->file_id(), (off_t) a, (off_t) (b - a), POSIX_FADV_DONTNEED);
+#endif
+                    dropped += b - a;
+                };
+                for (const auto & k : keep) {
+                    drop(pos, k.first);
+                    pos = std::max(pos, k.second);
+                }
+                drop(pos, mapping->size());
+            }
+            LLAMA_LOG_INFO("%s: released %.2f GB of mapped weights that only the GPUs use\n", __func__, dropped/1e9);
+        }
+        // lazily read tensors (engram tables): fault them in now that the weights went through the page cache
+        for (auto & mapping : mappings) {
+            mapping->populate_lazy();
+        }
+        // the other mmap'd CPU tensors (token embeddings, 217 MB for DeepSeek V4.1) too: a decode step otherwise faults its
+        // token's row in from disk (~0.5 ms per new token on the host critical path). LLAMA_MMAP_POPULATE_CPU=0 off.
+        static const bool populate_cpu = [] { const char * e = getenv("LLAMA_MMAP_POPULATE_CPU"); return !e || atoi(e) != 0; }();
+        if (populate_cpu && use_mmap) {
+            size_t total = 0;
+            for (uint32_t idx = 0; idx < mappings.size() && idx < mmaps_hot.size(); idx++) {
+                total += mappings.at(idx)->populate(mmaps_hot.at(idx));
+            }
+            LLAMA_LOG_INFO("%s: populated %.2f GB of mapped CPU tensors\n", __func__, total/1e9);
         }
         if (progress_callback) {
             // Even though the model is done loading, we still honor

@@ -148,6 +148,7 @@ enum llm_type {
     LLM_TYPE_288B_A19B, // dots3-note
     LLM_TYPE_300B_A47B, // Ernie MoE big
     LLM_TYPE_310B_A15B, // /MiMo-V2-Flash
+    LLM_TYPE_313B_A17B, // GLM-5.3-Flash
     LLM_TYPE_355B_A32B, // GLM-4.5
     LLM_TYPE_397B_A17B, // Qwen3.5
     LLM_TYPE_685B_A37B, // DeepSeek V3.2
@@ -579,6 +580,12 @@ struct llama_layer {
     struct ggml_tensor * hc_ffn_up      = nullptr;
     struct ggml_tensor * hc_ffn_inject  = nullptr;
 
+    // Engram (n-gram keyed lookup table) for DeepSeek-V4.1
+    struct ggml_tensor * engram_embd    = nullptr;
+    struct ggml_tensor * engram_k       = nullptr;
+    struct ggml_tensor * engram_q       = nullptr;
+    struct ggml_tensor * engram_wkv     = nullptr;
+
     struct ggml_tensor * ple_key        = nullptr;
     struct ggml_tensor * ple_value      = nullptr;
     struct ggml_tensor * ple_norm_key   = nullptr;
@@ -635,6 +642,7 @@ struct llama_model {
     struct ggml_tensor * output_res_score = nullptr; // kimi-k3: final cross-layer residual mix
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
+    struct ggml_tensor * output_draft    = nullptr; // first LLAMA_MTP_DRAFT_VOCAB rows of output (MTP drafting under -sm tensor)
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
 

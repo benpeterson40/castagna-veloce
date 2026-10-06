@@ -662,7 +662,10 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
     GGML_ASSERT(unary_src->nb[0] == ggml_element_size(unary_src));
     GGML_ASSERT(ggml_is_contiguous_1(other_src));
     GGML_ASSERT(other_src->nb[0] == ggml_element_size(other_src));
-    GGML_ASSERT(ggml_are_same_shape(unary_src, other_src));
+    // other: unary_src's shape, or one row used for every row (stride 0)
+    const bool other_row = !ggml_are_same_shape(unary_src, other_src);
+    GGML_ASSERT(!other_row || (ggml_nrows(other_src) == 1 && other_src->ne[0] == unary_src->ne[0] &&
+                               ggml_are_same_shape(mul_node, unary_src)));
 
     GGML_ASSERT(unary_src->type == GGML_TYPE_F32 || unary_src->type == GGML_TYPE_F16);
     GGML_ASSERT(unary_src->type == other_src->type);
@@ -673,7 +676,7 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
     const int64_t k  = ggml_nelements(mul_node);
     const int64_t nc = unary_src->ne[0];
     const int64_t unary_stride = unary_src->nb[1];
-    const int64_t other_stride = other_src->nb[1];
+    const int64_t other_stride = other_row ? 0 : other_src->nb[1];
 
     if (unary_src->type == GGML_TYPE_F16) {
         unary_gated_cuda<op>((const half *) unary_src->data, (const half *) other_src->data,

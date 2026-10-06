@@ -26,6 +26,7 @@
 #include "fit.h"
 #include "ggml.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // llama_set_embeddings_nextn (LLAMA_BENCH_NEXTN)
 #include "log.h"
 
 #ifdef _WIN32
@@ -1300,6 +1301,10 @@ struct cmd_params_instance {
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
+        // LLAMA_BENCH_RS_SEQ=n: recurrent-state rollback snapshots (a speculative server target uses the draft length);
+        // LLAMA_BENCH_NCTX=n: context size (the server's -c)
+        if (const char * e = getenv("LLAMA_BENCH_RS_SEQ")) { cparams.n_rs_seq = (uint32_t) atoi(e); }
+        if (const char * e = getenv("LLAMA_BENCH_NCTX"))   { cparams.n_ctx    = (uint32_t) atoi(e); }
 
         return cparams;
     }
@@ -2134,8 +2139,15 @@ struct ctx_state {
     std::vector<uint8_t> buf; // the llama_context state buffer
 };
 
+// LLAMA_BENCH_ALL_LOGITS=1: request logits for every prompt token (as a speculative verify batch does);
+// LLAMA_BENCH_NEXTN=1: also export the MTP hidden states (llama_set_embeddings_nextn), as an MTP target context does
 static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_threads) {
     llama_set_n_threads(ctx, n_threads, n_threads);
+    static const bool all_logits = [] { const char * e = getenv("LLAMA_BENCH_ALL_LOGITS"); return e && atoi(e) != 0; }();
+    static const bool nextn      = [] { const char * e = getenv("LLAMA_BENCH_NEXTN"); return e && atoi(e) != 0; }();
+    if (nextn) {
+        llama_set_embeddings_nextn(ctx, true, /*masked*/ false);
+    }
 
     const llama_model * model   = llama_get_model(ctx);
     const llama_vocab * vocab   = llama_model_get_vocab(model);
@@ -2151,7 +2163,19 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
         for (int i = 1; i < n_tokens; i++) {
             tokens[i] = std::rand() % n_vocab;
         }
-        int res = llama_decode(ctx, llama_batch_get_one(tokens.data(), n_tokens));
+        int res;
+        if (all_logits) {
+            llama_batch b = llama_batch_init(n_tokens, 0, 1);
+            const llama_pos p0 = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1; // continue after any depth prefill
+            for (int i = 0; i < n_tokens; ++i) {
+                b.token[i] = tokens[i]; b.pos[i] = p0 + i; b.n_seq_id[i] = 1; b.seq_id[i][0] = 0; b.logits[i] = 1;
+            }
+            b.n_tokens = n_tokens;
+            res = llama_decode(ctx, b);
+            llama_batch_free(b);
+        } else {
+            res = llama_decode(ctx, llama_batch_get_one(tokens.data(), n_tokens));
+        }
         if (res != 0) {
             fprintf(stderr, "%s: failed to decode prompt batch, res = %d\n", __func__, res);
             return false;

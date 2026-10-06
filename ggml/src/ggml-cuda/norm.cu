@@ -323,6 +323,57 @@ static void rms_norm_f32_cuda(
     }
 }
 
+// narrow contiguous rows (e.g. 128-wide per-head norms): one warp per row, float4 lanes, weight broadcast along the
+// row only. The generic kernel uses a 256-thread block per row, so such rows idle half the block and pay a
+// block-level reduction each.
+// src rows may be strided (s1/s2/s3 in floats, n1/n2 rows per channel/sample); dst rows are contiguous
+template <bool do_mul>
+static __global__ void rms_norm_f32_narrow(const float * __restrict__ x, float * __restrict__ dst,
+                                           const float * __restrict__ mul, const int ncols, const int64_t nrows_total,
+                                           const float eps, const float post_scale,
+                                           const int64_t n1, const int64_t n2, const int64_t s1, const int64_t s2, const int64_t s3) {
+    const int64_t row = (int64_t) blockIdx.x*(blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    if (row >= nrows_total) {
+        return;
+    }
+    const int64_t i1 = row % n1, i2 = (row / n1) % n2, i3 = row / (n1*n2);
+    const float4 * xr = (const float4 *) (x + i1*s1 + i2*s2 + i3*s3);
+    float4 v[4];
+    float ss = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int j = lane + k*WARP_SIZE;
+        if (j < ncols/4) {
+            v[k] = xr[j];
+            ss += v[k].x*v[k].x + v[k].y*v[k].y + v[k].z*v[k].z + v[k].w*v[k].w;
+        }
+    }
+    ss = warp_reduce_sum(ss);
+    const float r = rsqrtf(ss/ncols + eps) * post_scale;
+    float4 * dr = (float4 *) (dst + row*ncols);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int j = lane + k*WARP_SIZE;
+        if (j < ncols/4) {
+            float4 o = make_float4(v[k].x*r, v[k].y*r, v[k].z*r, v[k].w*r);
+            if constexpr (do_mul) {
+                const float4 m = ((const float4 *) mul)[j];
+                o.x *= m.x; o.y *= m.y; o.z *= m.z; o.w *= m.w;
+            }
+            dr[j] = o;
+        }
+    }
+}
+
+static bool rms_norm_narrow_ok(const int ncols, const int nrows, const int nchannels, const int64_t stride_row,
+                               const int64_t stride_channel, const int64_t stride_sample, const float * x, const float * dst) {
+    static const bool disabled = [] { const char * e = getenv("GGML_RMS_NORM_NO_NARROW"); return e && atoi(e) != 0; }();
+    return !disabled && ncols % 4 == 0 && ncols <= 4*4*WARP_SIZE && ncols <= 512 && stride_row == ncols &&
+        stride_channel == (int64_t) ncols*nrows && stride_sample == stride_channel*nchannels &&
+        ((uintptr_t) x) % 16 == 0 && ((uintptr_t) dst) % 16 == 0;
+}
+
 static void rms_norm_mul_f32_cuda(const float *  x,
                                   const float *  mul,
                                   const float *  add,
@@ -351,6 +402,19 @@ static void rms_norm_mul_f32_cuda(const float *  x,
                                   const float    eps,
                                   cudaStream_t   stream) {
     const dim3 blocks_num(nrows, nchannels, nsamples);
+    if (add == nullptr && rms_norm_narrow_ok(ncols, nrows, nchannels, stride_row, stride_channel, stride_sample, x, dst) &&
+            (mul == nullptr || (mul_ncols == (uint32_t) ncols && mul_nrows == 1 && mul_nchannels == 1 && mul_nsamples == 1 &&
+                                ((uintptr_t) mul) % 16 == 0))) {
+        const int64_t nrows_total = (int64_t) nrows*nchannels*nsamples;
+        const int rows_per_block = 256 / WARP_SIZE;
+        const int64_t nblocks = (nrows_total + rows_per_block - 1) / rows_per_block;
+        if (mul) {
+            rms_norm_f32_narrow<true><<<nblocks, 256, 0, stream>>>(x, dst, mul, ncols, nrows_total, eps, 1.0f, nrows_total, 1, ncols, 0, 0);
+        } else {
+            rms_norm_f32_narrow<false><<<nblocks, 256, 0, stream>>>(x, dst, nullptr, ncols, nrows_total, eps, 1.0f, nrows_total, 1, ncols, 0, 0);
+        }
+        return;
+    }
     if (mul == nullptr) {
         rms_norm_f32_cuda(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
         return;
@@ -496,6 +560,13 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s02 = nb02 / ts0;
     const int64_t s03 = nb03 / ts0;
 
+    if (rms_norm_narrow_ok(ne00, ne01, ne02, s01, s02, s03, src0_d, dst_d)) {
+        const int64_t nrows_total = ne01*ne02*ne03;
+        const int rows_per_block = 256 / WARP_SIZE;
+        rms_norm_f32_narrow<false><<<(nrows_total + rows_per_block - 1) / rows_per_block, 256, 0, stream>>>(
+            src0_d, dst_d, nullptr, ne00, nrows_total, eps, 1.0f, nrows_total, 1, ne00, 0, 0);
+        return;
+    }
     rms_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
 
@@ -695,4 +766,52 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+// RMS_NORM -> SCALE (bias 0) on narrow contiguous rows: the scale is applied in the norm kernel
+bool ggml_cuda_rms_norm_scale_narrow(ggml_backend_cuda_context & ctx, const ggml_tensor * rms, ggml_tensor * scale_node) {
+    const ggml_tensor * src0 = rms->src[0];
+    if (src0->type != GGML_TYPE_F32 || scale_node->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale_node) ||
+            ggml_get_op_params_f32(scale_node, 1) != 0.0f || src0->nb[0] != sizeof(float)) {
+        return false;
+    }
+    const ggml_tensor * dst = scale_node;
+    const int64_t ne00 = src0->ne[0], ne01 = src0->ne[1], ne02 = src0->ne[2], ne03 = src0->ne[3];
+    const int64_t s01 = src0->nb[1] / sizeof(float), s02 = src0->nb[2] / sizeof(float), s03 = src0->nb[3] / sizeof(float);
+    static const bool disabled = [] { const char * e = getenv("GGML_RMS_NORM_NO_NARROW"); return e && atoi(e) != 0; }();
+    // strided source rows are fine (e.g. per-head views of a wider row); each row must be contiguous and aligned
+    if (disabled || ne00 % 4 != 0 || ne00 > 512 || ne00 > 16*WARP_SIZE || s01 % 4 != 0 || s02 % 4 != 0 || s03 % 4 != 0 ||
+            ((uintptr_t) src0->data) % 16 != 0 || ((uintptr_t) dst->data) % 16 != 0) {
+        return false;
+    }
+    const float eps = ggml_get_op_params_f32(rms, 0);
+    const int64_t nrows_total = ne01*ne02*ne03;
+    const int rows_per_block = 256 / WARP_SIZE;
+    rms_norm_f32_narrow<false><<<(nrows_total + rows_per_block - 1) / rows_per_block, 256, 0, ctx.stream()>>>(
+        (const float *) src0->data, (float *) dst->data, nullptr, ne00, nrows_total, eps, ggml_get_op_params_f32(scale_node, 0),
+        ne01, ne02, s01, s02, s03);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// SCALE (bias 0) -> SILU on contiguous F32: silu(x*s) in one pass
+static __global__ void scale_silu_f32(const float * __restrict__ x, float * __restrict__ y, const float s, const int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float v = x[i]*s;
+        y[i] = v/(1.0f + expf(-v));
+    }
+}
+
+bool ggml_cuda_scale_silu(ggml_backend_cuda_context & ctx, const ggml_tensor * scale_node, ggml_tensor * silu) {
+    const ggml_tensor * x = scale_node->src[0];
+    if (x->type != GGML_TYPE_F32 || silu->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_contiguous(silu) ||
+            ggml_get_op_params_f32(scale_node, 1) != 0.0f || !ggml_are_same_shape(x, silu)) {
+        return false;
+    }
+    const int64_t n = ggml_nelements(silu);
+    scale_silu_f32<<<(n + 255)/256, 256, 0, ctx.stream()>>>((const float *) x->data, (float *) silu->data,
+                                                           ggml_get_op_params_f32(scale_node, 0), n);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }

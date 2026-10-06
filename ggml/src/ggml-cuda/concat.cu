@@ -1,5 +1,7 @@
 #include "concat.cuh"
 
+#include <algorithm>
+
 #include <stdint.h>
 
 // contiguous kernels
@@ -139,8 +141,111 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// dim-0 concat where src1 is a transposed view (its dim 1 is the contiguous one), e.g. the recurrent conv
+// input concat(conv_state, transpose(x)). The generic kernel walks src1 along dim 0, so neighbouring
+// threads read addresses ne11*sizeof(T) apart and nearly every load is its own cache line. Here each block
+// moves a 32x32 tile through shared memory: loads run along src1's contiguous dim 1, stores along dst's
+// contiguous dim 0. Blocks with blockIdx.y == 0 also copy the src0 part (the short state prefix).
+#define CONCAT_T_TILE 32
+#define CONCAT_T_ROWS 8
+
+template <typename T>
+static __global__ void __launch_bounds__(CONCAT_T_TILE*CONCAT_T_ROWS)
+    concat_dim0_transposed_src1(
+        const char * __restrict__ src0, const char * __restrict__ src1, char * __restrict__ dst,
+        const int64_t ne00, const int64_t ne10, const int64_t ne1,
+        const uint64_t nb01, const uint64_t nb02,
+        const uint64_t nb10, const uint64_t nb12,
+        const uint64_t nb1,  const uint64_t nb2) {
+    __shared__ T tile[CONCAT_T_TILE][CONCAT_T_TILE + 1];
+
+    const int64_t i2 = blockIdx.z;
+    // channel tiles vary fastest so concurrently running blocks read neighbouring pieces of the same
+    // src1 rows (DRAM locality); with time fastest each block's 32 rows sit ne11*sizeof(T) apart
+    const int64_t c0 = (int64_t) blockIdx.x*CONCAT_T_TILE; // position along dim 1 (channel)
+    const int64_t t0 = (int64_t) blockIdx.y*CONCAT_T_TILE; // position along src1 dim 0 (time)
+
+    // src0 prefix: dst[i0, i1] = src0[i0, i1] for i0 < ne00 (contiguous rows of length ne00)
+    if (blockIdx.y == 0) {
+        for (int r = threadIdx.y; r < CONCAT_T_TILE; r += CONCAT_T_ROWS) {
+            const int64_t i1 = c0 + r;
+            if (i1 >= ne1) {
+                break;
+            }
+            for (int64_t i0 = threadIdx.x; i0 < ne00; i0 += CONCAT_T_TILE) {
+                *(T *) (dst + i0*sizeof(T) + i1*nb1 + i2*nb2) = *(const T *) (src0 + i0*sizeof(T) + i1*nb01 + i2*nb02);
+            }
+        }
+    }
+
+    // load: consecutive threadIdx.x -> consecutive channels (src1 dim 1, stride sizeof(T))
+    for (int r = threadIdx.y; r < CONCAT_T_TILE; r += CONCAT_T_ROWS) {
+        const int64_t t = t0 + r;
+        const int64_t c = c0 + threadIdx.x;
+        if (t < ne10 && c < ne1) {
+            tile[r][threadIdx.x] = *(const T *) (src1 + t*nb10 + c*sizeof(T) + i2*nb12);
+        }
+    }
+    __syncthreads();
+
+    // store: consecutive threadIdx.x -> consecutive dst dim 0 positions (stride sizeof(T))
+    for (int r = threadIdx.y; r < CONCAT_T_TILE; r += CONCAT_T_ROWS) {
+        const int64_t c = c0 + r;
+        const int64_t t = t0 + threadIdx.x;
+        if (t < ne10 && c < ne1) {
+            *(T *) (dst + (ne00 + t)*sizeof(T) + c*nb1 + i2*nb2) = tile[threadIdx.x][r];
+        }
+    }
+}
+
+// dim-0 concat with short rows (dst->ne[0] <= 32), e.g. the recurrent conv input concat(conv_state [3, C], x [n_tokens, C])
+// at decode / MTP verify: the row-per-block kernels launched C blocks of 256 threads with 4..6 active (Qwen3.8-27B TP2,
+// C = 5120: ~20 us at 1 token, ~38 us at 3 per GDN layer). One thread per output element over a flat grid instead.
+template <typename T>
+static __global__ void __launch_bounds__(256) concat_dim0_small(
+        const char * __restrict__ src0, const char * __restrict__ src1, char * __restrict__ dst,
+        const int ne00, const int ne0, const int64_t ne1, const int64_t n,
+        const int64_t nb00, const int64_t nb01, const int64_t nb02,
+        const int64_t nb10, const int64_t nb11, const int64_t nb12,
+        const int64_t nb0,  const int64_t nb1,  const int64_t nb2) {
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x*blockDim.x) {
+        const int     i0 = (int) (i % ne0);
+        const int64_t r  = i / ne0;
+        const int64_t i1 = r % ne1;
+        const int64_t i2 = r / ne1;
+        const char * s = i0 < ne00 ? src0 + i0*nb00 + i1*nb01 + i2*nb02 : src1 + (i0 - ne00)*nb10 + i1*nb11 + i2*nb12;
+        *(T *) (dst + i0*nb0 + i1*nb1 + i2*nb2) = *(const T *) s;
+    }
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
+    static const bool no_small = [] { const char * e = getenv("GGML_CONCAT_NO_SMALL"); return e && atoi(e) != 0; }();
+    if (!no_small && dim == 0 && dst->ne[0] <= 32 && src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1) {
+        const int64_t n = ggml_nelements(dst);
+        const int nblk = (int) std::min<int64_t>((n + 255)/256, 1024);
+        concat_dim0_small<T><<<nblk, 256, 0, stream>>>((const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+            (int) src0->ne[0], (int) dst->ne[0], dst->ne[1], n,
+            src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[0], src1->nb[1], src1->nb[2], dst->nb[0], dst->nb[1], dst->nb[2]);
+        return;
+    }
+    // fast path: dim-0 concat of a contiguous src0 with a transposed src1 (3D, no 4th dim)
+    static const bool no_fast = [] { const char * e = getenv("GGML_CONCAT_NO_TRANSPOSED"); return e && atoi(e) != 0; }();
+    if (!no_fast && dim == 0 && src0->ne[3] == 1 && src1->ne[3] == 1 &&
+            src0->nb[0] == sizeof(T) && src1->nb[1] == sizeof(T) && src1->nb[0] > src1->nb[1] &&
+            dst->nb[0] == sizeof(T) && src1->ne[0] >= CONCAT_T_TILE) {
+        const dim3 block(CONCAT_T_TILE, CONCAT_T_ROWS, 1);
+        const dim3 grid((dst->ne[1]  + CONCAT_T_TILE - 1) / CONCAT_T_TILE,
+                        (src1->ne[0] + CONCAT_T_TILE - 1) / CONCAT_T_TILE, dst->ne[2]);
+        concat_dim0_transposed_src1<T><<<grid, block, 0, stream>>>(
+            (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+            src0->ne[0], src1->ne[0], dst->ne[1],
+            src0->nb[1], src0->nb[2],
+            src1->nb[0], src1->nb[2],
+            dst->nb[1], dst->nb[2]);
+        return;
+    }
+
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
         const T * src0_d = (const T *) src0->data;
         const T * src1_d = (const T *) src1->data;

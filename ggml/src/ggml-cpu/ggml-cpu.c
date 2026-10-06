@@ -1898,6 +1898,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_get_rows(params, tensor);
             } break;
+        case GGML_OP_GET_ROWS_MEAN:
+            {
+                ggml_compute_forward_get_rows_mean(params, tensor);
+            } break;
         case GGML_OP_GET_ROWS_BACK:
             {
                 ggml_compute_forward_get_rows_back(params, tensor);
@@ -2109,6 +2113,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
             } break;
+        case GGML_OP_DSV4_HC_MIX:
+            {
+                ggml_compute_forward_dsv4_hc_mix(params, tensor);
+            } break;
+        case GGML_OP_DSV4_SPARSE_ATTN:
+            {
+                ggml_compute_forward_dsv4_sparse_attn(params, tensor);
+            } break;
+        case GGML_OP_DSV4_COMP_POOL:
+            {
+                ggml_compute_forward_dsv4_comp_pool(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2292,6 +2308,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
+        case GGML_OP_DSV4_HC_MIX:
+        case GGML_OP_DSV4_SPARSE_ATTN:
+        case GGML_OP_DSV4_COMP_POOL:
             {
                 n_tasks = n_threads;
             } break;
@@ -2364,6 +2383,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_OUT_PROD:
+            {
+                n_tasks = n_threads;
+            } break;
+        case GGML_OP_GET_ROWS_MEAN:
             {
                 n_tasks = n_threads;
             } break;

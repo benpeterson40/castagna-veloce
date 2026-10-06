@@ -37,6 +37,9 @@ struct llama_model_loader {
 
         ggml_tensor * tensor;
 
+        // an alias of another weight's file data (add_prefix_rows_alias)
+        llama_tensor_weight(uint16_t idx, size_t offs, ggml_tensor * tensor) : idx(idx), offs(offs), tensor(tensor) {}
+
         llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
             if (tensor_idx < 0) {
@@ -124,6 +127,7 @@ struct llama_model_loader {
     llama_mmaps mappings;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
+    std::vector<ggml_context_ptr> alias_ctxs; // metadata of the prefix-row aliases
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 
@@ -139,6 +143,10 @@ struct llama_model_loader {
     size_t size_done = 0;
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
+    // per file: byte ranges of the tensors that stay in (and are read from) the mapping (CPU tensors)
+    std::vector<std::vector<std::pair<size_t, size_t>>> mmaps_keep;
+    // CPU tensors read on every token (token embeddings; not the lazily read engram tables): faulted in after load
+    std::vector<std::vector<std::pair<size_t, size_t>>> mmaps_hot;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
@@ -221,6 +229,11 @@ struct llama_model_loader {
     enum llm_arch get_arch() const;
 
     const llama_tensor_weight * get_weight(const char * name) const;
+
+    // register `alias` as a weight made of the first n_rows rows (ne[1]) of `base`: same file data, shorter tensor
+    // (rows are contiguous, so loading reads exactly those rows). Call before creating the tensor. Returns false if
+    // `base` is missing or not longer than n_rows.
+    bool add_prefix_rows_alias(const std::string & base, const std::string & alias, int64_t n_rows);
 
     const llama_tensor_weight & require_weight(const char * name) const;
 
