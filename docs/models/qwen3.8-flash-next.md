@@ -27,7 +27,7 @@ hyper-connection and MoE steps: 119.0 tok/s with MTP (79.5 plain) and 1,939 tok/
 processing.
 
 ```sh
-HIP_VISIBLE_DEVICES=0,1,2,3 \
+HIP_VISIBLE_DEVICES=0,1,2,3 LLAMA_TP_GROUP=2 \
 GGML_CUDA_VIRTUAL_PER_GPU=1 GGML_CUDA_HC_PERSIST=4 GGML_CUDA_HCP_AR=1 GGML_CUDA_HCP_INJ=1 \
 GGML_CUDA_DISABLE_GRAPHS=1 LLAMA_MTP_DRAFT_VOCAB=98304 LLAMA_CKPT_LAST_VERIFY=1 \
 ./build/bin/llama-server \
@@ -40,6 +40,7 @@ GGML_CUDA_DISABLE_GRAPHS=1 LLAMA_MTP_DRAFT_VOCAB=98304 LLAMA_CKPT_LAST_VERIFY=1 
 
 | Setting | Why |
 | --- | --- |
+| `LLAMA_TP_GROUP=2` | Two tensor-parallel pairs with the layers pipelined across them ([tensor-parallel pairs](../../README.md#tensor-parallel-pairs)). |
 | `GGML_CUDA_VIRTUAL_PER_GPU=1` | One pipeline stage per card; the build default of several helps only prompt processing. |
 | `GGML_CUDA_HC_PERSIST=4` | Persistent kernels for the hyper-connection and MoE steps of each layer. |
 | `GGML_CUDA_HCP_AR=1` | The all-reduce of each pair fused into those kernels. |

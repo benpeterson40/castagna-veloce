@@ -82,8 +82,8 @@ landed.
 
 ### Multiple cards
 
-- **Tensor-parallel pairs:** with 4 or more cards, tensor parallelism runs inside pairs of
-  cards and the layers are pipelined across the pairs
+- **Tensor-parallel pairs:** tensor parallelism inside pairs of cards, with the layers
+  pipelined across the pairs. Qwen3.8 Flash-Next's decode profile runs this way
   ([how it works](#tensor-parallel-pairs)).
 - **PCIe all-reduce for both layouts:** pairs write straight into the peer card's memory;
   groups of four use kernel peer writes for decode-sized tensors and copy-engine DMA for
@@ -116,10 +116,11 @@ landed.
 
 ## Tensor-parallel pairs
 
-With 4 or more cards, Castagna Veloce runs tensor parallelism in **pairs** by default. Each
-pair splits every matrix of its layers across its two cards, the layers are divided between
-the pairs, and the pairs run as a pipeline. Upstream llama.cpp's `-sm tensor` always puts all
-cards into one group.
+Castagna Veloce can run tensor parallelism in **pairs** of cards. Each pair splits every
+matrix of its layers across its two cards, the layers are divided between the pairs, and the
+pairs run as a pipeline. Qwen3.8 Flash-Next's decode profile uses this layout on 4 cards,
+while DeepSeek V4, GLM-5.3 and DeepSeek V4.1 run as groups of four. Upstream llama.cpp's
+`-sm tensor` always puts all cards into one group.
 
 ```mermaid
 flowchart LR
@@ -151,16 +152,15 @@ Why pairs suit the MI50:
 
 Choosing the layout:
 
-| `LLAMA_TP_GROUP` | Layout |
-| --- | --- |
-| unset (4 or more cards) | pairs: 2 + 2 on 4 cards, 2 + 2 + 2 + 2 on 8 |
-| `4` | groups of four: one group on 4 cards, two on 8 |
-| `0` | one group over all cards, as in upstream llama.cpp |
+| `LLAMA_TP_GROUP` | Layout | Used by |
+| --- | --- | --- |
+| `2` | pairs: 2 + 2 on 4 cards, 2 + 2 + 2 + 2 on 8 | Qwen3.8 Flash-Next, decode profile |
+| `4` | groups of four: one group on 4 cards, two on 8 | DeepSeek V4, GLM-5.3, DeepSeek V4.1 |
+| `0` | one group over all cards, as in upstream llama.cpp | |
 
-`LLAMA_TP_LAYER_SPLIT=a,b,...` sets the share of layers each group gets; by default it follows
-each group's free memory. The model guides set the layout per model: Qwen3.8 Flash-Next decodes
-as two pairs, while DeepSeek V4, GLM-5.3 and DeepSeek V4.1 run as groups of four
-(`LLAMA_TP_GROUP=4`).
+Left unset with `-sm tensor` on 4 or more cards, it also gives pairs, so the model guides
+always set it. `LLAMA_TP_LAYER_SPLIT=a,b,...` sets the share of layers each group gets; by
+default it follows each group's free memory.
 
 ## Philosophy
 
