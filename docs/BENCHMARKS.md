@@ -28,8 +28,8 @@ table shows the mean of the rest; those agree within 1%. Measured 2026-10-06.
 | GLM-5.3-Flash UD-Q2_K_XL | 4 | TP4, ubatch 1024 | 978.4 | 70.2 |
 | Qwen3.8 27B UD-Q4_K_XL | 2 | TP2, ubatch 1024 | 702.1 | 43.9 |
 | Qwen3.8 27B UD-Q4_K_XL | 4 | two TP2 pairs, ubatch 1024 | 943.2 | – |
-| Qwen3.8 Flash-Next UD-Q4_K_XL | 4 | prefill profile (layer split, ubatch 320) | 2,614.7 | – |
-| Qwen3.8 Flash-Next UD-Q4_K_XL | 4 | decode profile (two TP2 pairs, persistent kernels) | – | 79.5 |
+| Qwen3.8 Flash-Next UD-Q4_K_XL | 4 | decode profile (two TP2 pairs, persistent kernels, ubatch 320) | 1,939.2 | 79.5 |
+| Qwen3.8 Flash-Next UD-Q4_K_XL | 4 | prefill profile (layer split, ubatch 320) | 2,614.7 | 52.3 |
 
 Example, GLM-5.3-Flash:
 
@@ -67,6 +67,7 @@ python3 tools/mi50/srvbig.py 8080
 | GLM-5.3-Flash Q2 | MTP, 1 token | 79.5 | 83.4% | 423 ms |
 | Qwen3.8 27B (2 cards) | MTP, 2 tokens | 69.5 | 75.5% | 239 ms |
 | Qwen3.8 Flash-Next (decode profile) | MTP, 3 tokens | 119.0 | 69.3% | 200 ms |
+| Qwen3.8 Flash-Next (prefill profile) | MTP, 3 tokens | 79.1 | 70.2% | 175 ms |
 
 Measured 2026-10-05 (Flash-Next 2026-10-06) on the current code.
 
